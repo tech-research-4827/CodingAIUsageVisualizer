@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Copilot Usage Report</title>
+  <style>
+    body {
+      color: #1f2933;
+      font-family: Arial, sans-serif;
+      line-height: 1.45;
+      margin: 24px;
+    }
+    h1, h2 {
+      color: #102a43;
+    }
+    table {
+      border-collapse: collapse;
+      font-size: 13px;
+      margin: 12px 0 28px;
+      width: 100%;
+    }
+    th, td {
+      border: 1px solid #d9e2ec;
+      padding: 6px 8px;
+      text-align: right;
+      vertical-align: top;
+    }
+    th:first-child, td:first-child,
+    .text-cell {
+      text-align: left;
+    }
+    thead th {
+      background: #f0f4f8;
+    }
+    .total-row {
+      background: #f8fafc;
+      font-weight: bold;
+    }
+    .meta {
+      background: #f8fafc;
+      border: 1px solid #d9e2ec;
+      padding: 12px;
+    }
+    .table-scroll { overflow-x: auto; }
+    .chart {
+      min-height: 320px;
+    }
+  </style>
+  <script>{{ plotly_js|safe }}</script>
+</head>
+<body>
+  <h1>Copilot Usage Report</h1>
+  <section class="meta">
+    <div>Date range: {{ summary.date_from }} to {{ summary.date_to }}</div>
+    <div>Generated at: {{ summary.generated_at }}</div>
+    <div>AI Credit USD rate: {{ summary.currency.ai_credit_usd_rate }}</div>
+    <div>USD/JPY rate: {{ summary.currency.usd_jpy_rate }}</div>
+    <div>Copilot CLI policy: {{ summary.run_selection_policies.copilot_cli }}</div>
+    <div>Copilot Chat policy: {{ summary.run_selection_policies.copilot_chat }}</div>
+    <div>Copilot Chat: request-level attribution.</div>
+  </section>
+
+  <h2>Totals</h2>
+  <p>{{ summary.cli_attribution }}</p>
+  <p>{{ summary.primary_model_attribution }}</p>
+  <p>{{ summary.coverage }} — {{ summary.data_status }}</p>
+  <p>Known direct subtotal; missing credits records: {{ summary.totals.missing_credits_count }}.
+  Pie shares cover only known positive credits. Empty pie means no positive measured credits.
+  Unavailable days have no bar; measured zero remains in the table.</p>
+  <div>AI Credits: {{ summary.totals.ai_credits|credits }};
+    US$: {{ summary.totals.estimated_usd|usd }};
+    JP¥: {{ summary.totals.estimated_jpy|jpy }}</div>
+
+  <h2>Model Summary</h2>
+  <div class="chart">{{ model_chart|safe }}</div>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th class="text-cell">Model</th>
+        <th>JP¥</th>
+        <th>US$</th>
+        <th>AI Credits</th>
+        <th>Estimated Credits</th>
+        <th>Missing credits</th>
+        <th>Direct Nano AIU</th>
+        <th>Raw Input</th>
+        <th>Fresh Input</th>
+        <th>Cached Input</th>
+        <th>Cache Write</th>
+        <th>Output</th>
+        <th>Reasoning</th>
+        <th class="text-cell">Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.model_rows %}
+      <tr class="{{ 'total-row' if row.row_kind == 'total' else '' }}">
+        <td class="text-cell">{{ row.display_model }}</td>
+        <td>{{ row.estimated_jpy|jpy }}</td>
+        <td>{{ row.estimated_usd|usd }}</td>
+        <td>{{ row.ai_credits|credits }}</td>
+        <td>{{ row.estimated_primary_ai_credits|credits }}</td>
+        <td>{{ row.missing_credits_count|integer }}</td>
+        <td>{{ row.direct_nano_aiu|integer }}</td>
+        <td>{{ row.raw_input_tokens|integer }}</td>
+        <td>{{ row.fresh_input_tokens|integer }}</td>
+        <td>{{ row.cached_input_tokens|integer }}</td>
+        <td>{{ row.cache_write_tokens|integer }}</td>
+        <td>{{ row.output_tokens|integer }}</td>
+        <td>{{ row.reasoning_tokens|integer }}</td>
+        <td class="text-cell">{{ row.confidence }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+
+  <h2>Daily Usage</h2>
+  <div class="chart">{{ daily_chart|safe }}</div>
+  <p>{{ summary.primary_model_attribution }}</p>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th class="text-cell">Date</th>
+        <th class="text-cell">Model</th>
+        <th>JP¥</th>
+        <th>US$</th>
+        <th>AI Credits</th>
+        <th>Missing credits</th>
+        <th>Unattrib.</th>
+        <th>Direct Nano AIU</th>
+        <th>Raw Input</th>
+        <th>Fresh Input</th>
+        <th>Cached Input</th>
+        <th>Cache Write</th>
+        <th>Output</th>
+        <th>Reasoning</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.daily_rows %}
+      <tr class="{{ 'total-row' if row.row_kind in ['total', 'day'] else '' }}">
+        <td class="text-cell">{{ row.date }}</td>
+        <td class="text-cell">{{ row.display_model }}</td>
+        <td>{{ row.estimated_jpy|jpy }}</td>
+        <td>{{ row.estimated_usd|usd }}</td>
+        <td>{{ row.ai_credits|credits }}</td>
+        <td>{{ row.missing_credits_count|integer }}</td>
+        <td>{{ row.unattributed_ai_credits|credits }}</td>
+        <td>{{ row.direct_nano_aiu|integer }}</td>
+        <td>{{ row.raw_input_tokens|integer }}</td>
+        <td>{{ row.fresh_input_tokens|integer }}</td>
+        <td>{{ row.cached_input_tokens|integer }}</td>
+        <td>{{ row.cache_write_tokens|integer }}</td>
+        <td>{{ row.output_tokens|integer }}</td>
+        <td>{{ row.reasoning_tokens|integer }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+
+  <h2>Detail</h2>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th>Workspace</th>
+        <th>Timestamp</th>
+        <th>Session</th>
+        <th>Model</th>
+        <th>Source</th>
+        <th>JP¥</th>
+        <th>US$</th>
+        <th>AI Credits</th>
+        <th>Nano AIU</th>
+        <th>Raw Input</th>
+        <th>Fresh Input</th>
+        <th>Cached Input</th>
+        <th>Cache Write</th>
+        <th>Output</th>
+        <th>Reasoning</th>
+        <th>Run</th>
+        <th>Run Kind</th>
+        <th>Policy</th>
+        <th>Credits Source</th>
+        <th>Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.detail_rows %}
+      <tr>
+        <td>{{ row.workspace_alias }}</td>
+        <td class="text-cell">{{ row.timestamp }}</td>
+        <td class="text-cell">{{ row.session_id }}</td>
+        <td>{{ row.display_model }}</td>
+        <td>{{ row.source }}</td>
+        <td>{{ row.estimated_jpy|jpy }}</td>
+        <td>{{ row.estimated_usd|usd }}</td>
+        <td>{{ row.ai_credits|credits }}</td>
+        <td>{{ row.reported_nano_aiu|integer }}</td>
+        <td>{{ row.raw_input_tokens|integer }}</td>
+        <td>{{ row.fresh_input_tokens|integer }}</td>
+        <td>{{ row.cached_input_tokens|integer }}</td>
+        <td>{{ row.cache_write_tokens|integer }}</td>
+        <td>{{ row.output_tokens|integer }}</td>
+        <td>{{ row.reasoning_tokens|integer }}</td>
+        <td>{{ row.run_id }}</td>
+        <td>{{ row.run_kind }}</td>
+        <td>{{ row.run_selection_policy }}</td>
+        <td>{{ row.ai_credits_source }}</td>
+        <td>{{ row.confidence }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+
+  <h2>Model Breakdown</h2>
+  <p>{{ breakdown_note }}</p>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th class="text-cell">Model</th>
+        <th class="text-cell">Source</th>
+        <th class="text-cell">Kind</th>
+        <th class="text-cell">Attribution</th>
+        <th class="text-cell">Raw Model</th>
+        <th class="text-cell">Estimated Model</th>
+        <th class="text-cell">Status</th>
+        <th>JP¥</th>
+        <th>US$</th>
+        <th>AI Credits</th>
+        <th>Estimated Credits</th>
+        <th>Missing credits</th>
+        <th>Direct Nano AIU</th>
+        <th>Raw Input</th>
+        <th>Fresh Input</th>
+        <th>Cached Input</th>
+        <th>Cache Write</th>
+        <th>Output</th>
+        <th>Reasoning</th>
+        <th class="text-cell">Confidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.model_breakdown %}
+      <tr>
+        <td class="text-cell">{{ row.display_model }}</td>
+        <td class="text-cell">{{ row.source if row.source is not none else "-" }}</td>
+        <td class="text-cell">{{ row.kind if row.kind is not none else "-" }}</td>
+        <td class="text-cell">{{ row.attribution if row.attribution is not none else "-" }}</td>
+        <td class="text-cell">{{ row.raw_model_key if row.raw_model_key is not none else "-" }}</td>
+        <td class="text-cell">{{ row.estimated_primary_model if row.estimated_primary_model is not none else "-" }}</td>
+        <td class="text-cell">{{ row.inclusion_status if row.inclusion_status is not none else "-" }}</td>
+        <td>{{ row.estimated_jpy|jpy }}</td>
+        <td>{{ row.estimated_usd|usd }}</td>
+        <td>{{ row.ai_credits|credits }}</td>
+        <td>{{ row.estimated_primary_ai_credits|credits }}</td>
+        <td>{{ row.missing_credits_count|integer }}</td>
+        <td>{{ row.direct_nano_aiu|integer }}</td>
+        <td>{{ row.raw_input_tokens|integer }}</td>
+        <td>{{ row.fresh_input_tokens|integer }}</td>
+        <td>{{ row.cached_input_tokens|integer }}</td>
+        <td>{{ row.cache_write_tokens|integer }}</td>
+        <td>{{ row.output_tokens|integer }}</td>
+        <td>{{ row.reasoning_tokens|integer }}</td>
+        <td class="text-cell">{{ row.confidence }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+
+  <h2>Confidence Breakdown</h2>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th>Confidence</th>
+        <th>Coarse</th>
+        <th>Records</th>
+        <th>AI Credits</th>
+        <th>Direct Nano AIU</th>
+        <th>Missing credits</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.confidence_breakdown %}
+      <tr>
+        <td class="text-cell">{{ row.confidence }}</td>
+        <td>{{ row.coarse_confidence }}</td>
+        <td>{{ row.records_count|integer }}</td>
+        <td>{{ row.ai_credits|credits }}</td>
+        <td>{{ row.direct_nano_aiu|integer }}</td>
+        <td>{{ row.missing_credits_count|integer }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+
+  <h2>Diagnostics</h2>
+  <div>Warnings: {{ summary.diagnostics.warnings_count }}</div>
+  <div class="table-scroll"><table>
+    <thead>
+      <tr>
+        <th>Code</th>
+        <th>Count</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in summary.diagnostics.by_code %}
+      <tr>
+        <td class="text-cell">{{ row.code }}</td>
+        <td>{{ row.count|integer }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  <details>
+    <summary>Third-party licenses (Plotly.js 3.6.0)</summary>
+    <div class="table-scroll"><pre>{{ third_party_licenses }}</pre></div>
+  </details>
+</body>
+</html>
