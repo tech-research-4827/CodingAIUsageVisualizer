@@ -318,6 +318,9 @@ class CliHistoryParser:
         """理由は固定コードで通知し、使用量以外のDB内容を漏らさない。"""
         return DiagnosticRecord(
             "copilot_cli_history", str(path), "session-store.db", f"cli_history_{reason}",
-            "Request history is incomplete or unavailable; inspect coverage before using totals.",
+            CliHistorySnapshot.failure_message(reason) or (
+                "Request history is incomplete or unavailable; "
+                "inspect coverage before using totals."
+            ),
             session_id=session,
         )

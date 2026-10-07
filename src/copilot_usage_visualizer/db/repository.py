@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,10 @@ from sqlite3 import Connection, Row
 from typing import cast
 
 from copilot_usage_visualizer.db.migrations import MigrationService
+from copilot_usage_visualizer.ingestion.wsl_cli_history import (
+    WslCliHistoryTransport,
+    WslHistoryLocation,
+)
 from copilot_usage_visualizer.normalization.credits import CliHistorySelection
 from copilot_usage_visualizer.normalization.usage import (
     CliHistorySnapshot,
@@ -29,6 +34,7 @@ class StoredScanResult:
     scan_id: int
     records_count: int
     diagnostics_count: int
+    history_warnings: tuple[str, ...] = ()
 
 
 # SQLite repository。
@@ -58,6 +64,13 @@ class UsageRepository:
         )
         required = {"session_id", "initiator", "model", "created_at", "total_nano_aiu",
                     "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"}
+        location: WslHistoryLocation | None = (
+            WslHistoryLocation.from_path(str(path)) if os.name == "nt" else None
+        )
+        if location is not None:
+            return WslCliHistoryTransport.read(
+                location, UsageRepository.WSL_HISTORY_SCRIPT, allowed, required, session_id
+            )
         try:
             connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
             connection.execute("BEGIN")
@@ -79,7 +92,56 @@ class UsageRepository:
             finally:
                 connection.close()
         except sqlite3.Error:
-            return CliHistorySnapshot(error="history_unavailable")
+            return CliHistorySnapshot(error="history_unavailable", read_failed=True)
+
+    # 外部 Python へ渡すコードは標準ライブラリのみで、SQL 境界の責務をここに置く。
+    WSL_HISTORY_SCRIPT: str = '''import base64
+import json
+import sqlite3
+from pathlib import Path
+
+
+# 共有越しのロックを避け、本文のない許可列だけを返す。
+class HistoryReader:
+    """WSL の native SQLite transaction で履歴を射影する。"""
+
+    @staticmethod
+    def run(request_json):
+        """起動元が固定した許可列を読み、SQLite の型を維持して返す。"""
+        request = json.loads(request_json)
+        result = {"columns": [], "rows": [], "error": None}
+        connection = None
+        try:
+            connection = sqlite3.connect(Path(request["path"]).as_uri() + "?mode=ro", uri=True)
+            connection.execute("BEGIN")
+            columns = {str(r[1]) for r in connection.execute(
+                "PRAGMA table_info(assistant_usage_events)"
+            )}
+            allowed = request["allowed"]
+            if not set(request["required"]) <= columns:
+                result["error"] = "unsupported_history_schema"
+            else:
+                if columns - set(allowed) - {"id"}:
+                    result["error"] = "unsupported_history_schema"
+                selected = [c for c in allowed if c in columns]
+                result["columns"] = selected
+                sql = ("SELECT " if result["error"] else "SELECT DISTINCT ") + ", ".join(selected)
+                sql += " FROM assistant_usage_events"
+                session = request["session_id"]
+                if session is not None:
+                    sql += " WHERE session_id = ?"
+                result["rows"] = [
+                    [{"blob": base64.b64encode(c).decode("ascii")} if isinstance(c, bytes)
+                     else c for c in row]
+                    for row in connection.execute(sql, (session,) if session is not None else ())
+                ]
+        except sqlite3.Error:
+            result = {"columns": [], "rows": [], "error": "history_unavailable"}
+        finally:
+            if connection is not None:
+                connection.close()
+        print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+'''
 
     # DB 接続を作成する。
     def connect(self) -> Connection:
@@ -141,35 +203,9 @@ class UsageRepository:
                         for sid in history.invalid_sessions
                     ],
                 )
-            # 別ファイルに同一sessionがある場合は順序を推測せず両方を除外する。
-            connection.execute(
-                "DELETE FROM diagnostics WHERE diagnostic_code = ?", ("cli_duplicate_session",)
-            )
-            connection.execute(
-                f"""WITH {self._all_usage_cte()}
-                INSERT INTO diagnostics
-                    (scan_id, source_file_id, diagnostic_code, message)
-                SELECT ?, MIN(source_file_id), 'cli_duplicate_session',
-                    'Session identity occurs in multiple files; usage excluded.'
-                FROM all_usage u JOIN runs r ON r.run_id = u.run_id
-                WHERE r.source = 'copilot_cli' AND r.run_kind != 'request_history'
-                GROUP BY r.session_id HAVING COUNT(DISTINCT source_file_id) > 1""",
-                (scan_id,),
-            )
             for diagnostic in diagnostics:
                 self._insert_diagnostic(connection, scan_id, diagnostic)
-            connection.execute(
-                "DELETE FROM diagnostics WHERE diagnostic_code LIKE 'cli_compaction_unresolved_%' "
-                "OR diagnostic_code LIKE 'cli_history_selection_%'"
-            )
-            selection = self._select_usage(connection)
-            connection.executemany(
-                "INSERT INTO diagnostics (scan_id, source_file_id, diagnostic_code, message) "
-                "VALUES (?, ?, ?, ?)",
-                [(scan_id, source_id, code,
-                  "Usage overlap is unresolved; unconfirmed observations are not added.")
-                 for source_id, code in sorted(set(selection.issues))],
-            )
+            self.refresh_selection_diagnostics(connection, scan_id)
             diagnostics_count = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM diagnostics WHERE scan_id = ?", (scan_id,)
@@ -184,7 +220,42 @@ class UsageRepository:
                 scan_id=scan_id,
                 records_count=records_count,
                 diagnostics_count=diagnostics_count,
+                history_warnings=tuple(dict.fromkeys(
+                    message for diagnostic in diagnostics
+                    if diagnostic.source == "copilot_cli_history"
+                    and (message := CliHistorySnapshot.failure_message(
+                        diagnostic.code.removeprefix("cli_history_")
+                    )) is not None
+                )),
             )
+
+    # scan と merge で、統合後の状態を同じ規則で診断する。
+    def refresh_selection_diagnostics(self, connection: Connection, scan_id: int) -> None:
+        """保存 transaction 内で DB 全体の選択診断だけを作り直す。"""
+
+        connection.execute(
+            "DELETE FROM diagnostics WHERE diagnostic_code = 'cli_duplicate_session' "
+            "OR diagnostic_code LIKE 'cli_compaction_unresolved_%' "
+            "OR diagnostic_code LIKE 'cli_history_selection_%'"
+        )
+        connection.execute(
+            f"""WITH {self._all_usage_cte()}
+            INSERT INTO diagnostics (scan_id, source_file_id, diagnostic_code, message)
+            SELECT ?, MIN(source_file_id), 'cli_duplicate_session',
+                'Session identity occurs in multiple files; usage excluded.'
+            FROM all_usage u JOIN runs r ON r.run_id = u.run_id
+            WHERE r.source = 'copilot_cli' AND r.run_kind != 'request_history'
+            GROUP BY r.session_id HAVING COUNT(DISTINCT source_file_id) > 1""",
+            (scan_id,),
+        )
+        selection: UsageSelection = self._select_usage(connection)
+        connection.executemany(
+            "INSERT INTO diagnostics (scan_id, source_file_id, diagnostic_code, message) "
+            "VALUES (?, ?, ?, ?)",
+            [(scan_id, source_id, code,
+              "Usage overlap is unresolved; unconfirmed observations are not added.")
+             for source_id, code in sorted(set(selection.issues))],
+        )
 
     # summary とreportは同じ選択済み射影を使う。
     def summary_records(self, date_from: str, date_to: str) -> list[UsageRow]:

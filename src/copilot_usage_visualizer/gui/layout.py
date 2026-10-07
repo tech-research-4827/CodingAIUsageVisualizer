@@ -73,34 +73,53 @@ class TabLayoutSpec:
     CHROME_HEIGHT: ClassVar[int] = 88
     # 残余消費 widget に保証する最低実用高。
     MIN_RESIDUAL_HEIGHT: ClassVar[int] = 160
+    # 本文 font の設計値 (`DashboardTheme.FONT_SIZE_BODY`)。
+    # layout は dearpygui へ依存しないため複製し、テストで一致を保つ。
+    BODY_FONT_PX: ClassVar[int] = 16
 
     label: str
     fixed_height: int
     residual_widget_tag: str
+    # fixed_height のうち文字の行高で決まる分を、本文 font の行数で表す (文字の大きさで伸びる)。
+    font_lines: float = 0.0
 
     # 残余高を求める。
-    def residual_height(self, viewport_height: int) -> int:
-        """viewport 高から残余消費 widget の高さを求める。
+    def residual_height(
+        self, viewport_height: int, scale: float = 1.0, font_factor: float = 1.0
+    ) -> int:
+        """viewport 高 (実寸 px) から残余消費 widget の高さ (実寸 px) を求める。
 
+        固定高・chrome・最低実用高は 100% の設計値なので、表示倍率を掛けてから引く。
+        文字の大きさを上げると `font_lines` 行ぶんの高さが本文 font の増分だけ伸びる。
         可用高が最低実用高を下回る場合でも最低実用高を返す。
         その場合は固定 content 合計が可視領域を超えるため、
         タブ本体 child window の縦 scroll で全体を辿れる。
         """
 
-        available: int = viewport_height - self.CHROME_HEIGHT - self.fixed_height
-        return max(self.MIN_RESIDUAL_HEIGHT, available)
+        font_extra: float = self.font_lines * self.BODY_FONT_PX * (font_factor - 1.0)
+        available: int = viewport_height - round(
+            (self.CHROME_HEIGHT + self.fixed_height + font_extra) * scale
+        )
+        return max(round(self.MIN_RESIDUAL_HEIGHT * scale), available)
 
     # 全タブの残余高を求める。
     @classmethod
     def residual_heights(
-        cls, specs: Sequence[TabLayoutSpec], viewport_height: int
+        cls,
+        specs: Sequence[TabLayoutSpec],
+        viewport_height: int,
+        scale: float = 1.0,
+        font_factor: float = 1.0,
     ) -> dict[str, int]:
         """残余消費 widget tag から高さへの対応を返す。
 
         初期表示と viewport resize の双方がこの 1 つの計算を共有する。
         """
 
-        return {spec.residual_widget_tag: spec.residual_height(viewport_height) for spec in specs}
+        return {
+            spec.residual_widget_tag: spec.residual_height(viewport_height, scale, font_factor)
+            for spec in specs
+        }
 
 
 # table 1 つ分の描画計画を保持する。
@@ -693,7 +712,10 @@ class DashboardLayout:
     # widget 行 28px を前提に置く（`DashboardTheme.form_row_height` /
     # `text_row_height` / `heading_height` に対応する）。
     TAB_LAYOUTS: tuple[TabLayoutSpec, ...] = (
-        TabLayoutSpec(label="設定・アクション", fixed_height=504, residual_widget_tag="log_box"),
+        TabLayoutSpec(
+            label="設定・アクション", fixed_height=676, residual_widget_tag="log_box",
+            font_lines=22.5,
+        ),
         TabLayoutSpec(
             label="Diagnostics", fixed_height=72, residual_widget_tag="diagnostics_table"
         ),
@@ -704,7 +726,18 @@ class DashboardLayout:
         TabLayoutSpec(
             label="セッションごとの詳細", fixed_height=28, residual_widget_tag="detail_table"
         ),
+        # 上段の操作 1 行と状態の文 1 行 (button 24px + 文 + 行間) を固定し、残りを本体に充てる。
+        TabLayoutSpec(
+            label="セッション使用量", fixed_height=64, residual_widget_tag="su_body", font_lines=3,
+        ),
     )
+
+    # 設定タブの固定高のうち文字の行高で決まる分 (本文 font の行数)。
+    @classmethod
+    def settings_font_lines(cls) -> float:
+        """window の最小・既定の高さを文字の大きさに合わせて増やす時の行数を返す。"""
+
+        return cls.TAB_LAYOUTS[0].font_lines
 
     # tag から table spec を引く。
     @classmethod

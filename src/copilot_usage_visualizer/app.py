@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
 from copilot_usage_visualizer.analytics.summary import SummaryService
+from copilot_usage_visualizer.db.merge import DerivedDatabaseMerger, MergeResult
 from copilot_usage_visualizer.db.repository import StoredScanResult, UsageRepository
 from copilot_usage_visualizer.ingestion.scanning import ScanService
 from copilot_usage_visualizer.report.html import HtmlReportService
@@ -30,12 +32,18 @@ class DateRangeValidator:
 class UsageApplication:
     """CLI command と core services を接続する。"""
 
+    # 取得環境ごとの派生 DB を、新規の集計用 DB にまとめる。
+    def merge(self, input_paths: Sequence[Path], output_path: Path) -> MergeResult:
+        """原本を変更せず統合し、重なる session を報告する。"""
+
+        return DerivedDatabaseMerger().merge(input_paths, output_path)
+
     # scan を実行する。
     def scan(
         self,
         db_path: Path,
-        cli_log_root: Path | None,
-        chat_storage_root: Path | None,
+        cli_log_roots: Sequence[Path],
+        chat_storage_roots: Sequence[Path],
         full: bool = False,
         cli_history_db: Path | None = None,
     ) -> StoredScanResult:
@@ -45,17 +53,20 @@ class UsageApplication:
         （全体読み直し）。reset と保存は repository 側で同一 transaction にまとめる。
         """
 
-        if cli_history_db is not None and cli_history_db.resolve() == db_path.resolve():
-            raise ValueError("Input history and output database must be different files.")
-        if (cli_log_root is not None and cli_history_db is None
-                and (cli_log_root.resolve().parent / "session-store.db") == db_path.resolve()):
-            raise ValueError("Input history and output database must be different files.")
-        parsed_scan = ScanService().scan(
-            cli_log_root=cli_log_root,
-            chat_storage_root=chat_storage_root,
+        service: ScanService = ScanService()
+        cli_roots: tuple[Path, ...] = service.resolve_roots(cli_log_roots, "CLI")
+        chat_roots: tuple[Path, ...] = service.resolve_roots(chat_storage_roots, "Chat")
+        for history_path in service.history_paths(cli_roots, cli_history_db):
+            if (history_path.resolve() == db_path.resolve()
+                    or (history_path.exists() and db_path.exists()
+                        and history_path.samefile(db_path))):
+                raise ValueError("Input history and output database must be different files.")
+        parsed_scan = service.scan(
+            cli_log_roots=cli_roots,
+            chat_storage_roots=chat_roots,
             cli_history_db=cli_history_db,
         )
-        root_label: str = self._root_label(cli_log_root, chat_storage_root, cli_history_db)
+        root_label: str = self._root_label(cli_log_roots, chat_storage_roots, cli_history_db)
         return UsageRepository(db_path).store_scan(
             parsed_scan.records,
             parsed_scan.diagnostics,
@@ -126,16 +137,14 @@ class UsageApplication:
 
     # root label を作成する。
     def _root_label(
-        self, cli_log_root: Path | None, chat_storage_root: Path | None,
+        self, cli_log_roots: Sequence[Path], chat_storage_roots: Sequence[Path],
         cli_history_db: Path | None = None,
     ) -> str:
         """scan root の raw path を DB 保存しないため hash 入力用 label を作る。"""
 
         parts: list[str] = []
-        if cli_log_root is not None:
-            parts.append(f"cli:{cli_log_root}")
-        if chat_storage_root is not None:
-            parts.append(f"chat:{chat_storage_root}")
+        parts.extend(f"cli:{root}" for root in cli_log_roots)
+        parts.extend(f"chat:{root}" for root in chat_storage_roots)
         if cli_history_db is not None:
             parts.append(f"history:{cli_history_db}")
         return "|".join(parts)

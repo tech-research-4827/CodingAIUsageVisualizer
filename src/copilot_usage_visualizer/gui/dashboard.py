@@ -3,12 +3,25 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
+from typing import cast
 
 import dearpygui.dearpygui as dpg
 
 from copilot_usage_visualizer.formatting import UsageValueFormatter
 from copilot_usage_visualizer.gui.data import DashboardDataProvider
+from copilot_usage_visualizer.gui.date_range import (
+    DatePickerValue,
+    DateRangePresets,
+    PickerDate,
+)
+from copilot_usage_visualizer.gui.display_scale import (
+    DisplayScale,
+    DisplayScaleResolver,
+    FontSizeChoice,
+    UiScaleChoice,
+)
 from copilot_usage_visualizer.gui.dpg_support import DpgSupport
 from copilot_usage_visualizer.gui.layout import (
     DashboardLayout,
@@ -18,7 +31,9 @@ from copilot_usage_visualizer.gui.layout import (
     TableRenderPlan,
     TableSpec,
 )
+from copilot_usage_visualizer.gui.session_usage_view import SessionUsageTab
 from copilot_usage_visualizer.gui.settings import DashboardSettings
+from copilot_usage_visualizer.gui.settings_store import DashboardSettingsStore, SettingsStoreError
 from copilot_usage_visualizer.gui.theme import DashboardTheme, DashboardThemeAssets, DpgItem
 
 
@@ -36,8 +51,13 @@ class DashboardView:
         "btn_scan_full",
         "btn_refresh",
         "btn_export",
+        "btn_save_settings",
     )
 
+    # ウィンドウ名。製品名に合わせる (package・command 名は従来のまま)。
+    _WINDOW_TITLE: str = "Coding AI Usage Visualizer"
+
+    # 以下の幅・高さは 100% の設計値。描画時に表示倍率を掛ける (`_px`)。
     # 設定欄の title 列幅。最長 label が 18px font で収まる幅にする。
     _LABEL_COLUMN_WIDTH: int = 260
     # 日付入力の幅。YYYY-MM-DD の 10 文字に合わせる。
@@ -45,6 +65,17 @@ class DashboardView:
     # rate 入力の幅。dearpygui は step button 分も width に含めるため、
     # 値の表示幅（"160.00"）と -/+ button の合計を確保する。
     _RATE_INPUT_WIDTH: int = 160
+    # 期間行で日付入力と一括指定 button の間に置く余白。
+    _PERIOD_PRESET_GAP: int = 16
+    # 表示倍率の選択欄の幅。"自動 (250%)" が収まる幅にする。
+    _UI_SCALE_COMBO_WIDTH: int = 160
+    # 文字の大きさの選択欄の幅。"150%" と選択 button が収まる幅にする。
+    _FONT_SIZE_COMBO_WIDTH: int = 84
+    # 表示倍率・文字の大きさの行で部品の間に置く余白。最小幅でも文字 150% で収まる幅にする。
+    _DISPLAY_GAP: int = 12
+    # 表示倍率・文字の大きさの行に常に表示する、再起動が必要な旨。短くして最小幅でも見切れない
+    # ようにし、全文は tooltip と保存時の Log に出す。
+    _RESTART_NOTE: str = "Restart to apply"
     # pie plot の描画サイズ。equal_aspects のため正方形の描画領域を確保する。
     _PIE_WIDTH: int = 460
     _PIE_HEIGHT: int = 320
@@ -57,15 +88,33 @@ class DashboardView:
     _VIEWPORT_MIN_WIDTH: int = 1200
     _VIEWPORT_MIN_HEIGHT: int = 800
 
-    def __init__(self, settings: DashboardSettings, data_provider: DashboardDataProvider) -> None:
+    def __init__(
+        self, settings: DashboardSettings, data_provider: DashboardDataProvider,
+        settings_store: DashboardSettingsStore | None = None,
+    ) -> None:
         """設定と data provider を保持する。"""
 
         self._settings: DashboardSettings = settings
         self._data: DashboardDataProvider = data_provider
+        self._settings_store: DashboardSettingsStore = (
+            settings_store if settings_store is not None else DashboardSettingsStore()
+        )
         self._pending: tuple[str, Callable[[], None]] | None = None
         self._theme: DashboardThemeAssets | None = None
+        # 起動時に確定する表示倍率。変更の保存は次回起動で反映する。
+        self._display_scale: DisplayScale | None = None
+        self._running_scale_percent: int | None = settings.ui_scale_percent
+        self._running_font_percent: int = settings.font_size_percent
+        # date picker で値を書き込む日付入力欄の tag。
+        self._picker_target: str | None = None
         # daily plot の軸 lock を次 frame で解除するための予約。
         self._axis_release_pending: bool = False
+        # セッション使用量タブ。CLI log root は scan を待たず設定欄の現在値を使う。
+        self._session_tab: SessionUsageTab = SessionUsageTab(
+            roots=self._current_cli_log_roots,
+            log=self._log,
+            theme=self._theme_assets,
+        )
 
     # dashboard を起動する。
     def run(self) -> None:
@@ -75,23 +124,35 @@ class DashboardView:
         同じ helper を 1 度呼んでから resize callback を登録する。
         """
 
+        # Windows の DPI 対応の宣言は context と window を作る前に行う必要がある。
+        self._display_scale = DisplayScaleResolver.resolve(
+            self._settings.ui_scale_percent, DisplayScaleResolver.detect_system_percent()
+        )
         dpg.create_context()
-        self._theme = DashboardTheme.build()
+        self._theme = DashboardTheme.build(
+            self._display_scale.factor, self._settings.font_size_percent / 100
+        )
         self._build_layout()
+        # 文字の大きさで設定タブが伸びた分だけ、window の高さも増やす (button と Log を保つ)。
+        growth: float = self._theme_assets().font_growth(
+            DashboardLayout.settings_font_lines()
+        )
         dpg.create_viewport(
-            title="Copilot Usage Dashboard",
-            width=self._VIEWPORT_WIDTH,
-            height=self._VIEWPORT_HEIGHT,
-            min_width=self._VIEWPORT_MIN_WIDTH,
-            min_height=self._VIEWPORT_MIN_HEIGHT,
+            title=self._WINDOW_TITLE,
+            width=self._px(self._VIEWPORT_WIDTH),
+            height=self._px(self._VIEWPORT_HEIGHT + growth),
+            min_width=self._px(self._VIEWPORT_MIN_WIDTH),
+            min_height=self._px(self._VIEWPORT_MIN_HEIGHT + growth),
         )
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.set_primary_window("primary_window", True)
         self._apply_residual_heights()
+        self._session_tab.on_resize()
         dpg.set_viewport_resize_callback(self._on_viewport_resize)
-        self._sync_settings()
         self._log_degraded_modes()
+        for message in self._settings.startup_messages:
+            self._log(message)
         self._initial_load()
         self._event_loop()
         dpg.destroy_context()
@@ -101,14 +162,17 @@ class DashboardView:
         """現在の viewport 高から各タブの残余消費 widget の高さを設定する。"""
 
         heights: dict[str, int] = TabLayoutSpec.residual_heights(
-            DashboardLayout.TAB_LAYOUTS, dpg.get_viewport_height()
+            DashboardLayout.TAB_LAYOUTS,
+            dpg.get_viewport_height(),
+            self._theme_assets().scale,
+            self._theme_assets().font_factor,
         )
         for tag, height in heights.items():
             dpg.configure_item(tag, height=height)
         # ネストした panel の余白を引き、viewport resize にも追従させる。
         content_width: int = max(
-            self._LABEL_COLUMN_WIDTH,
-            dpg.get_viewport_client_width() - 6 * DashboardTheme.WINDOW_PADDING[0],
+            self._fpx(self._LABEL_COLUMN_WIDTH),
+            dpg.get_viewport_client_width() - self._px(6 * DashboardTheme.WINDOW_PADDING[0]),
         )
         dpg.configure_item("diagnostics_summary_text", wrap=content_width)
         dpg.configure_item("pie_model_names", wrap=content_width)
@@ -117,8 +181,8 @@ class DashboardView:
         dpg.configure_item(
             "coverage_text",
             wrap=max(
-                self._LABEL_COLUMN_WIDTH,
-                content_width - self._PIE_WIDTH - DashboardTheme.ITEM_SPACING[0],
+                self._fpx(self._LABEL_COLUMN_WIDTH),
+                content_width - self._px(self._PIE_WIDTH + DashboardTheme.ITEM_SPACING[0]),
             ),
         )
 
@@ -131,6 +195,7 @@ class DashboardView:
         """
 
         self._apply_residual_heights()
+        self._session_tab.on_resize()
 
     # degraded mode を Log へ出す。
     def _log_degraded_modes(self) -> None:
@@ -146,6 +211,7 @@ class DashboardView:
         while dpg.is_dearpygui_running():
             dpg.render_dearpygui_frame()
             self._release_daily_axis_lock()
+            self._session_tab.on_frame()
             if self._pending is None:
                 continue
             # 無効化したボタンと開始 Log を 1 frame 描画してから実行する。
@@ -188,6 +254,13 @@ class DashboardView:
         """起動時に report / diagnostics を読み込む。"""
 
         try:
+            self._settings.validate()
+        except ValueError as exc:
+            # 起動時の検証通知を既に Log に出している時だけ、重複を抑える。
+            if str(exc) not in self._settings.startup_messages:
+                self._log(f"load error: {exc}")
+            return
+        try:
             self._load_and_render()
         except (OSError, ValueError) as exc:
             self._log(f"load error: {exc}")
@@ -200,17 +273,55 @@ class DashboardView:
             raise ValueError("theme assets are not built yet")
         return self._theme
 
+    # 起動時に確定した表示倍率を返す。
+    def _scale_info(self) -> DisplayScale:
+        """確定済みの表示倍率を返す（未確定は `ValueError`）。"""
+
+        if self._display_scale is None:
+            raise ValueError("display scale is not resolved yet")
+        return self._display_scale
+
+    # 文字の大きさに連動する設計値の px を実寸にする。
+    def _fpx(self, value: float) -> int:
+        """文字数で決める幅の設計値に、表示倍率と文字の大きさを掛ける。"""
+
+        return self._theme_assets().fpx(value)
+
+    # 設計値の px を表示倍率の実寸にする。
+    def _px(self, value: float) -> int:
+        """幅・高さ・余白の設計値に表示倍率を掛ける。"""
+
+        return self._theme_assets().px(value)
+
     # layout を構築する。
     def _build_layout(self) -> None:
         """primary window とタブを構築する。"""
 
         with DpgSupport.context(dpg.window(tag="primary_window")):
-            with DpgSupport.context(dpg.tab_bar()):
+            with DpgSupport.context(dpg.tab_bar(callback=self._on_tab_changed)):
                 self._build_settings_tab()
                 self._build_diagnostics_tab()
                 self._build_model_tab()
                 self._build_daily_tab()
                 self._build_detail_tab()
+                self._session_tab.build()
+        self._build_date_picker_popup()
+
+    # タブが切り替わった時。
+    def _on_tab_changed(self, _sender: DpgItem, _tab: DpgItem) -> None:
+        """セッション使用量タブが前面になった時だけ、そのタブに読み込ませる。
+
+        判定はタブ側が tab bar の値で行う (dearpygui の app_data は選ばれたタブ)。
+        """
+
+        if self._session_tab.is_active():
+            self._session_tab.on_tab_selected()
+
+    # 設定欄の CLI log root の現在値。
+    def _current_cli_log_roots(self) -> tuple[Path, ...]:
+        """scan していない編集中の値も使う (セッション使用量は DB を使わず記録を直接読むため)。"""
+
+        return DashboardSettings.parse_roots(str(dpg.get_value("in_cli_log_roots")))
 
     # 設定・アクションタブを構築する。
     def _build_settings_tab(self) -> None:
@@ -219,11 +330,12 @@ class DashboardView:
         with DpgSupport.context(dpg.tab(label="設定・アクション")):
             with DpgSupport.context(dpg.child_window(autosize_x=True, autosize_y=True)):
                 self._form_group("データソース", self._add_source_rows)
-                self._form_group("Database", self._add_storage_rows)
-                self._form_group("出力先", self._add_output_rows)
+                self._form_group("保存先", self._add_storage_rows)
                 self._form_group("集計条件", self._add_condition_rows)
+                self._form_group("GUI 設定", self._add_gui_setting_rows)
+                self._add_gui_setting_tooltips()
                 self._build_action_buttons()
-                dpg.add_spacer(height=DashboardTheme.GROUP_SPACER_HEIGHT)
+                dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
                 self._heading("Log:")
                 dpg.add_input_text(
                     tag="log_box",
@@ -237,52 +349,200 @@ class DashboardView:
     def _add_source_rows(self) -> None:
         """scan 対象 log root の入力欄を追加する。"""
 
-        self._form_path_row("Copilot CLI log root", "in_cli_log_root", self._settings.cli_log_root)
-        self._form_path_row(
-            "VS Code Chat storage root", "in_chat_storage_root", self._settings.chat_storage_root
+        self._form_roots_row(
+            "Copilot CLI log roots", "in_cli_log_roots", self._settings.cli_log_roots
+        )
+        self._form_roots_row(
+            "VS Code Chat storage roots", "in_chat_storage_roots", self._settings.chat_storage_roots
+        )
+        self._form_row(
+            "Source input",
+            lambda: dpg.add_text(
+                "One path per line; blank disables a source.\n"
+                "Data from removed roots stays in the DB until scan (全体読み直し).",
+                wrap=0,
+            ),
         )
 
-    # DB / import file 欄を追加する。
+    # 保存先欄を追加する。設定タブの高さを保つため DB と report 出力先を 1 群にまとめる。
     def _add_storage_rows(self) -> None:
-        """DB と import file の入力欄を追加する。"""
+        """DB と report 出力先の入力欄を追加する。"""
 
         self._form_path_row("DB path", "in_db_path", self._settings.db_path)
-
-    # 出力先欄を追加する。
-    def _add_output_rows(self) -> None:
-        """report 出力先の入力欄を追加する。"""
-
         self._form_path_row("Report output", "in_report_output", self._settings.report_output)
 
     # 集計条件欄を追加する。
     def _add_condition_rows(self) -> None:
         """期間と換算 rate の入力欄を追加する。"""
 
-        self._form_row(
-            "Date from (YYYY-MM-DD)",
-            lambda: dpg.add_input_text(
-                tag="in_date_from",
-                default_value=self._settings.date_from,
-                width=self._DATE_INPUT_WIDTH,
-            ),
-        )
-        self._form_row(
-            "Date to (YYYY-MM-DD)",
-            lambda: dpg.add_input_text(
-                tag="in_date_to",
-                default_value=self._settings.date_to,
-                width=self._DATE_INPUT_WIDTH,
-            ),
-        )
+        self._form_row("Period (YYYY-MM-DD)", self._add_period_widgets)
         self._form_row(
             "USD -> JPY rate",
-            lambda: dpg.add_input_float(
+            lambda: dpg.add_input_double(
                 tag="in_usd_jpy_rate",
                 default_value=self._settings.usd_jpy_rate,
-                width=self._RATE_INPUT_WIDTH,
+                width=self._fpx(self._RATE_INPUT_WIDTH),
                 format="%.2f",
             ),
         )
+
+    # 期間の 1 行。2 行に分けないことで設定タブの固定高を保つ。
+    def _add_period_widgets(self) -> None:
+        """開始・終了の入力欄、date picker の button、一括指定の button を 1 行に並べる。"""
+
+        with DpgSupport.context(dpg.group(horizontal=True)):
+            dpg.add_input_text(
+                tag="in_date_from",
+                default_value=self._settings.date_from,
+                width=self._fpx(self._DATE_INPUT_WIDTH),
+            )
+            dpg.add_button(
+                label="選択", tag="btn_pick_date_from",
+                callback=self._on_pick_date, user_data="in_date_from",
+            )
+            dpg.add_text("-")
+            dpg.add_input_text(
+                tag="in_date_to",
+                default_value=self._settings.date_to,
+                width=self._fpx(self._DATE_INPUT_WIDTH),
+            )
+            dpg.add_button(
+                label="選択", tag="btn_pick_date_to",
+                callback=self._on_pick_date, user_data="in_date_to",
+            )
+            dpg.add_spacer(width=self._px(self._PERIOD_PRESET_GAP))
+            # 時系列順に並べる (ユーザーの選択)。
+            dpg.add_button(
+                label="先月", tag="btn_period_last_month",
+                callback=self._on_period_preset, user_data=DateRangePresets.last_month,
+            )
+            dpg.add_button(
+                label="今月", tag="btn_period_this_month",
+                callback=self._on_period_preset, user_data=DateRangePresets.this_month,
+            )
+            dpg.add_button(
+                label="今日", tag="btn_period_today",
+                callback=self._on_period_preset, user_data=DateRangePresets.today,
+            )
+
+    # 設定ファイルの保存先と、表示倍率・文字の大きさの欄を追加する。
+    def _add_gui_setting_rows(self) -> None:
+        """保存先は読み取り専用で示し、表示倍率と文字の大きさは 1 行の選択肢から選ぶ。
+
+        どちらも起動時だけ適用するため、再起動が必要な旨を同じ行に常に表示する。
+        1 行にまとめて、設定タブの固定高を保つ。
+        """
+
+        self._form_row(
+            "Settings file",
+            lambda: dpg.add_input_text(
+                tag="settings_location", default_value=self._settings_location(),
+                readonly=True, width=-1,
+            ),
+        )
+        self._form_row("Display", self._add_display_widgets)
+
+    # 表示倍率と文字の大きさの選択肢を 1 行に並べる。
+    def _add_display_widgets(self) -> None:
+        """UI scale と Font size の combo、再起動が必要な旨の注記を横に並べる。"""
+
+        auto_percent: int = self._scale_info().auto_percent
+        with DpgSupport.context(dpg.group(horizontal=True)):
+            dpg.add_text("UI scale")
+            dpg.add_combo(
+                list(UiScaleChoice.labels(auto_percent)),
+                tag="in_ui_scale",
+                default_value=UiScaleChoice.label_for(
+                    self._settings.ui_scale_percent, auto_percent
+                ),
+                width=self._fpx(self._UI_SCALE_COMBO_WIDTH),
+            )
+            dpg.add_spacer(width=self._px(self._DISPLAY_GAP))
+            dpg.add_text("Font size")
+            dpg.add_combo(
+                list(FontSizeChoice.labels()),
+                tag="in_font_size",
+                default_value=FontSizeChoice.label_for(self._settings.font_size_percent),
+                width=self._fpx(self._FONT_SIZE_COMBO_WIDTH),
+            )
+            dpg.add_spacer(width=self._px(self._DISPLAY_GAP))
+            dpg.add_text(self._RESTART_NOTE, tag="display_restart_note")
+
+    # table cell に tooltip を混ぜないよう、form の外で補足を付ける。
+    def _add_gui_setting_tooltips(self) -> None:
+        """保存先の全文と、表示倍率・文字の大きさが次回起動で反映されることを示す。"""
+
+        wrap: int = self._px(DashboardTheme.SETTINGS_TOOLTIP_WRAP)
+        with DpgSupport.context(dpg.tooltip("settings_location")):
+            dpg.add_text("Local settings file (not included in usage reports).")
+            dpg.add_text(self._settings_location(), wrap=wrap)
+        with DpgSupport.context(dpg.tooltip("in_ui_scale")):
+            dpg.add_text(
+                "Whole-window scale. Saved changes apply after restart.",
+                wrap=wrap,
+            )
+        with DpgSupport.context(dpg.tooltip("in_font_size")):
+            dpg.add_text(
+                "Text size on top of UI scale. Saved changes apply after restart.", wrap=wrap
+            )
+
+    # 設定ファイルの保存先の表示文字列。
+    def _settings_location(self) -> str:
+        """保存先を求められない環境では、その旨を表示する。"""
+
+        try:
+            return str(self._settings_store.path)
+        except SettingsStoreError:
+            return "Settings location unavailable."
+
+    # 期間の入力欄の横から date picker を開く。
+    def _on_pick_date(self, sender: DpgItem, _app_data: object, target: str) -> None:
+        """入力欄の日付 (不正なら今日) で date picker を開き、書き込み先を覚える。"""
+
+        self._picker_target = target
+        dpg.set_value(
+            "date_picker",
+            DatePickerValue.to_picker(str(dpg.get_value(target)), date.today()),
+        )
+        # button の左下に開き、入力欄を隠さない。
+        left, _ = dpg.get_item_rect_min(sender)
+        _, bottom = dpg.get_item_rect_max(sender)
+        dpg.configure_item("date_picker_popup", show=True, pos=(left, bottom))
+
+    # date picker で日を選んだ時。
+    def _on_date_picked(self, _sender: DpgItem, app_data: object) -> None:
+        """選んだ日を入力欄へ書き込んで閉じる。集計は「GUI report 更新」で反映する。"""
+
+        target: str | None = self._picker_target
+        dpg.configure_item("date_picker_popup", show=False)
+        if target is None:
+            return
+        # dearpygui の境界では dict で渡るため、契約どおりの TypedDict として読む。
+        dpg.set_value(target, DatePickerValue.from_picker(cast(PickerDate, app_data)))
+        self._picker_target = None
+
+    # 一括指定の button。
+    def _on_period_preset(
+        self, _sender: DpgItem, _app_data: object,
+        preset: Callable[[date], tuple[str, str]],
+    ) -> None:
+        """開始・終了の入力欄だけを変える (ユーザーの選択: 自動では再集計しない)。"""
+
+        date_from, date_to = preset(date.today())
+        dpg.set_value("in_date_from", date_from)
+        dpg.set_value("in_date_to", date_to)
+
+    # date picker の popup を構築する。
+    def _build_date_picker_popup(self) -> None:
+        """開始・終了で共用する 1 つの popup。外側を押すと閉じる。"""
+
+        with DpgSupport.context(
+            dpg.window(
+                tag="date_picker_popup", popup=True, show=False,
+                no_title_bar=True, autosize=True,
+            )
+        ):
+            dpg.add_date_picker(tag="date_picker", callback=self._on_date_picked)
 
     # action button 群を構築する。
     def _build_action_buttons(self) -> None:
@@ -298,6 +558,10 @@ class DashboardView:
             )
             dpg.add_button(label="GUI report 更新", tag="btn_refresh", callback=self._on_refresh)
             dpg.add_button(label="report HTML export", tag="btn_export", callback=self._on_export)
+            # 保存は副操作として既定色で末尾に置き、結果は Log に出す。
+            dpg.add_button(
+                label="設定を保存", tag="btn_save_settings", callback=self._on_save_settings
+            )
         dpg.bind_item_theme("btn_scan_delta", theme.primary_button_theme)
         dpg.bind_item_theme("btn_refresh", theme.primary_button_theme)
         dpg.bind_item_theme("btn_scan_full", theme.caution_button_theme)
@@ -325,7 +589,7 @@ class DashboardView:
                 with DpgSupport.context(dpg.group(horizontal=True)):
                     self._build_model_pie()
                     self._build_kpi_panel()
-                dpg.add_spacer(height=DashboardTheme.GROUP_SPACER_HEIGHT)
+                dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
                 with DpgSupport.context(dpg.tree_node(label="Legend model names")):
                     dpg.add_text("", tag="pie_model_names")
                 self._table_section("Model summary", "model_table")
@@ -341,8 +605,8 @@ class DashboardView:
             dpg.plot(
                 tag="model_pie_plot",
                 label="Known AI Credits by model",
-                width=self._PIE_WIDTH,
-                height=self._PIE_HEIGHT,
+                width=self._px(self._PIE_WIDTH),
+                height=self._px(self._PIE_HEIGHT),
                 equal_aspects=True,
                 no_mouse_pos=True,
             )
@@ -370,7 +634,7 @@ class DashboardView:
         """合計値を円グラフ右の空き領域へ最上位情報として配置する。"""
 
         placeholder: KpiValues = KpiValues.placeholder()
-        with DpgSupport.context(dpg.child_window(width=-1, height=self._PIE_HEIGHT)):
+        with DpgSupport.context(dpg.child_window(width=-1, height=self._px(self._PIE_HEIGHT))):
             self._kpi_entry("集計期間", "kpi_period", placeholder.period)
             self._kpi_entry("JP¥", "kpi_jpy", placeholder.jpy)
             self._kpi_entry("US$", "kpi_usd", placeholder.usd)
@@ -383,7 +647,7 @@ class DashboardView:
 
         self._heading(title)
         dpg.add_text(initial, tag=tag)
-        dpg.add_spacer(height=DashboardTheme.GROUP_SPACER_HEIGHT)
+        dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
 
     # 日付概要タブを構築する。
     def _build_daily_tab(self) -> None:
@@ -396,7 +660,7 @@ class DashboardView:
                         tag="daily_plot",
                         label="Known credits converted to JP¥ by day",
                         width=-1,
-                        height=self._DAILY_PLOT_HEIGHT,
+                        height=self._px(self._DAILY_PLOT_HEIGHT),
                         no_mouse_pos=True,
                     )
                 ):
@@ -405,7 +669,7 @@ class DashboardView:
                     dpg.add_plot_axis(dpg.mvYAxis, label="JP¥", tag="daily_bar_y")
                     # lock 解除後もユーザ操作で負値域へ入らないよう下限を拘束する。
                     dpg.set_axis_limits_constraints("daily_bar_y", 0.0, float("inf"))
-                dpg.add_spacer(height=DashboardTheme.GROUP_SPACER_HEIGHT)
+                dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
                 dpg.add_text(UsageValueFormatter.PRIMARY_MODEL_NOTE, tag="daily_note", wrap=0)
                 self._table_section("Daily usage", "daily_table")
 
@@ -433,7 +697,9 @@ class DashboardView:
         ここでは最低実用高で初期化する。
         """
 
-        height: int = TabLayoutSpec.MIN_RESIDUAL_HEIGHT if spec.residual else spec.height
+        height: int = self._px(
+            TabLayoutSpec.MIN_RESIDUAL_HEIGHT if spec.residual else spec.height
+        )
         table: DpgItem = dpg.add_table(
             tag=spec.tag,
             header_row=True,
@@ -488,10 +754,12 @@ class DashboardView:
             dpg.table(header_row=False, resizable=False, policy=dpg.mvTable_SizingFixedFit)
         ) as table:
             self._apply_body_style(table)
-            dpg.add_table_column(init_width_or_weight=self._LABEL_COLUMN_WIDTH, width_fixed=True)
+            dpg.add_table_column(
+                init_width_or_weight=self._fpx(self._LABEL_COLUMN_WIDTH), width_fixed=True
+            )
             dpg.add_table_column(width_stretch=True)
             add_rows()
-        dpg.add_spacer(height=DashboardTheme.GROUP_SPACER_HEIGHT)
+        dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
 
     # form の path 行を追加する。
     def _form_path_row(self, label: str, tag: str, value: object) -> None:
@@ -500,6 +768,20 @@ class DashboardView:
         self._form_row(
             label,
             lambda: dpg.add_input_text(tag=tag, default_value=str(value), width=-1),
+        )
+
+    # root の個数に依存しない高さで複数行を編集する。
+    def _form_roots_row(self, label: str, tag: str, roots: tuple[Path, ...]) -> None:
+        """複数 root の入力欄を既存の2列 form に追加する。"""
+
+        self._form_row(
+            label,
+            lambda: dpg.add_input_text(
+                tag=tag, default_value="\n".join(str(root) for root in roots),
+                multiline=True, width=-1, height=self._px(
+                    DashboardTheme.SOURCE_INPUT_HEIGHT + self._theme_assets().font_growth(3)
+                ),
+            ),
         )
 
     # form 行を追加する。
@@ -514,13 +796,27 @@ class DashboardView:
     def _sync_settings(self) -> None:
         """入力欄の現在値を DashboardSettings へ反映する。"""
 
-        self._settings.db_path = Path(dpg.get_value("in_db_path"))
-        self._settings.cli_log_root = Path(dpg.get_value("in_cli_log_root"))
-        self._settings.chat_storage_root = Path(dpg.get_value("in_chat_storage_root"))
-        self._settings.report_output = Path(dpg.get_value("in_report_output"))
+        db_text: str = str(dpg.get_value("in_db_path"))
+        report_text: str = str(dpg.get_value("in_report_output"))
+        if not db_text.strip() or not report_text.strip():
+            raise ValueError("DB path and Report output must not be blank. Edit the path fields.")
+        self._settings.db_path = Path(db_text)
+        self._settings.cli_log_roots = DashboardSettings.parse_roots(
+            str(dpg.get_value("in_cli_log_roots"))
+        )
+        self._settings.chat_storage_roots = DashboardSettings.parse_roots(
+            str(dpg.get_value("in_chat_storage_roots"))
+        )
+        self._settings.report_output = Path(report_text)
         self._settings.date_from = str(dpg.get_value("in_date_from"))
         self._settings.date_to = str(dpg.get_value("in_date_to"))
         self._settings.usd_jpy_rate = float(dpg.get_value("in_usd_jpy_rate"))
+        self._settings.ui_scale_percent = UiScaleChoice.parse_label(
+            str(dpg.get_value("in_ui_scale"))
+        )
+        self._settings.font_size_percent = FontSizeChoice.parse_label(
+            str(dpg.get_value("in_font_size"))
+        )
 
     # action button の有効/無効を切り替える。
     def _set_buttons_enabled(self, enabled: bool) -> None:
@@ -549,10 +845,44 @@ class DashboardView:
         if self._pending is not None:
             self._log(f"{name}: 実行中のため無視しました")
             return
-        self._sync_settings()
+        try:
+            self._sync_settings()
+        except ValueError as exc:
+            self._log(f"{name} error: {exc}")
+            return
         self._set_buttons_enabled(False)
         self._log(f"{name}: 開始")
         self._pending = (name, worker)
+
+    # 保存はアクション予約で二重実行を防ぐが scan は呼ばない。
+    def _on_save_settings(self) -> None:
+        """現在の入力の保存を予約する。"""
+
+        self._request_action("Save settings", self._do_save_settings)
+
+    # 完成した設定を置き換えた時だけ表示値も保存値に合わせる。
+    def _do_save_settings(self) -> None:
+        """全入力を保存し、成功・失敗を Log へ表示する。"""
+
+        try:
+            saved: DashboardSettings = self._settings_store.save(self._settings)
+        except (SettingsStoreError, ValueError) as exc:
+            message: str = str(exc)
+        else:
+            self._settings = saved
+            dpg.set_value("in_db_path", str(saved.db_path))
+            dpg.set_value("in_report_output", str(saved.report_output))
+            dpg.set_value("in_cli_log_roots", "\n".join(str(root) for root in saved.cli_log_roots))
+            dpg.set_value(
+                "in_chat_storage_roots", "\n".join(str(root) for root in saved.chat_storage_roots),
+            )
+            message = "Settings saved."
+            # 文字・余白は起動時に作るため、倍率・文字の大きさの変更は再起動まで反映されない。
+            if saved.ui_scale_percent != self._running_scale_percent:
+                message += " UI scale applies after restart."
+            if saved.font_size_percent != self._running_font_percent:
+                message += " Font size applies after restart."
+        self._log(message)
 
     # report 更新 callback。
     def _on_refresh(self) -> None:
@@ -589,6 +919,7 @@ class DashboardView:
                 {
                     "records_count": result.records_count,
                     "diagnostics_count": result.diagnostics_count,
+                    "history_warnings": result.history_warnings,
                     "scan_id": result.scan_id,
                 }
             )

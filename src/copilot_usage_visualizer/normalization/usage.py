@@ -127,7 +127,7 @@ class ParsedUsageRecord:
     ai_credits_source: str = AiCreditsSource.UNAVAILABLE
     event_order: int = 0
     attribution_scope: str = "model"
-    # 金額の直接値とは独立した、終了内訳の単一モデル名による手がかり。
+    # 金額の直接値とは独立した、累積期間の主応答・終了内訳による推定名。
     estimated_primary_model: str | None = None
     # 圧縮の観測値と包含判定を加算値から分離する。
     observed_nano_aiu: int | None = None
@@ -171,9 +171,42 @@ class ParsedSourceFile:
 class CliHistorySnapshot:
     """SQL境界の列名と行、利用不能理由を保持する。"""
 
+    # WSL 取得の上限を処理と診断文で共有する。
+    WSL_TIMEOUT_SECONDS: ClassVar[int] = 30
     columns: tuple[str, ...] = ()
     rows: tuple[tuple[object, ...], ...] = ()
     error: str | None = None
+    read_failed: bool = False
+
+    # 取得経路の外部出力を診断本文へ混ぜない。
+    @staticmethod
+    def failure_message(reason: str) -> str | None:
+        """履歴の読み取り失敗にだけ、固定の確認手順を返す。"""
+
+        messages: dict[str, str] = {
+            "history_unavailable": "CLI history could not be read; check database access.",
+            "wsl_timeout": (
+                f"WSL history read timed out after {CliHistorySnapshot.WSL_TIMEOUT_SECONDS} "
+                "seconds; check that WSL is responsive "
+                "and scan again."
+            ),
+            "wsl_process_failed": (
+                "WSL history reader did not return a successful response; check the selected "
+                "distribution and python3 3.10+ with SQLite support."
+            ),
+            "wsl_history_unavailable": (
+                "WSL history database could not be read; check its existence and read access "
+                "inside the selected distribution."
+            ),
+            "wsl_invalid_response": (
+                "WSL history reader returned an invalid response; check python3 3.10+ "
+                "with SQLite support in the selected distribution."
+            ),
+        }
+        message: str | None = messages.get(reason)
+        if message is None:
+            return None
+        return message + " Totals may change until the next successful history read."
 
 
 # 履歴入力の利用可否と、日付を割り当てられない行のあるsessionを保持する。

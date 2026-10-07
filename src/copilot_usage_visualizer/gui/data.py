@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
@@ -18,8 +19,8 @@ class _UsageApplicationFacade(Protocol):
     def scan(
         self,
         db_path: Path,
-        cli_log_root: Path | None,
-        chat_storage_root: Path | None,
+        cli_log_roots: Sequence[Path],
+        chat_storage_roots: Sequence[Path],
         full: bool = False,
     ) -> StoredScanResult: ...
 
@@ -63,11 +64,10 @@ class DashboardDataProvider:
     def rescan(self, settings: DashboardSettings, full: bool) -> StoredScanResult:
         """設定された source root を scan する（full=True で全体読み直し）。"""
 
-        self._ensure_parent(settings.db_path)
         return self._application.scan(
             settings.db_path,
-            settings.cli_log_root,
-            settings.chat_storage_root,
+            settings.cli_log_roots,
+            settings.chat_storage_roots,
             full=full,
         )
 

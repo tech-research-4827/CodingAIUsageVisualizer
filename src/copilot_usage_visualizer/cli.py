@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from copilot_usage_visualizer import __version__
@@ -18,6 +19,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="Print the package version.")
     subparsers = parser.add_subparsers(dest="command")
 
+    merge_parser = subparsers.add_parser("merge", help="Combine derived DBs into a new DB.")
+    merge_parser.add_argument(
+        "--input", dest="inputs", action="append", required=True, type=Path,
+        help="Read-only derived database (repeat for each input).",
+    )
+    merge_parser.add_argument("--output", type=Path, required=True, help="New database path.")
+
     scan_parser = subparsers.add_parser("scan", help="Scan Copilot log roots into SQLite.")
     scan_parser.add_argument(
         "--db", default=AppDefaults().db_path(), type=Path, help="SQLite DB path."
@@ -25,9 +33,19 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument(
         "--cli-history-db", type=Path, help="Copilot request history SQLite input."
     )
-    scan_parser.add_argument("--cli-log-root", type=Path, help="Copilot CLI session-state root.")
     scan_parser.add_argument(
-        "--chat-storage-root", type=Path, help="VS Code workspaceStorage root."
+        "--cli-log-root",
+        dest="cli_log_roots",
+        action="append",
+        type=Path,
+        help="Copilot CLI session-state root (repeatable).",
+    )
+    scan_parser.add_argument(
+        "--chat-storage-root",
+        dest="chat_storage_roots",
+        action="append",
+        type=Path,
+        help="VS Code workspaceStorage root (repeatable).",
     )
     scan_parser.add_argument(
         "--full",
@@ -93,10 +111,22 @@ def build_parser() -> argparse.ArgumentParser:
         "gui", help="Open the desktop dashboard (see also: copilot-usage-gui)."
     )
     gui_parser.add_argument(
-        "--db", type=Path, help="SQLite DB path (default: output/copilot-usage.db)."
+        "--db", type=Path, help="Override saved DB path (unsaved: output/copilot-usage.db)."
     )
-    gui_parser.add_argument("--cli-log-root", type=Path, help="Copilot CLI session-state root.")
-    gui_parser.add_argument("--chat-storage-root", type=Path, help="VS Code workspaceStorage root.")
+    gui_parser.add_argument(
+        "--cli-log-root",
+        dest="cli_log_roots",
+        action="append",
+        type=Path,
+        help="Copilot CLI session-state root (repeatable).",
+    )
+    gui_parser.add_argument(
+        "--chat-storage-root",
+        dest="chat_storage_roots",
+        action="append",
+        type=Path,
+        help="VS Code workspaceStorage root (repeatable).",
+    )
     gui_parser.add_argument("--output", type=Path, help="HTML report output path.")
     gui_parser.add_argument("--from", dest="date_from", help="Initial start date YYYY-MM-DD.")
     gui_parser.add_argument("--to", dest="date_to", help="Initial end date YYYY-MM-DD.")
@@ -131,16 +161,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        if args.command == "merge":
+            print(json.dumps(asdict(application.merge(args.inputs, args.output)), sort_keys=True))
+            return 0
         if args.command == "scan":
-            if (args.cli_log_root is None and args.chat_storage_root is None
-                    and args.cli_history_db is None):
-                print("scan requires --cli-log-root, --chat-storage-root or --cli-history-db.",
-                      file=sys.stderr)
+            if (
+                args.cli_log_roots is None
+                and args.chat_storage_roots is None
+                and args.cli_history_db is None
+            ):
+                print(
+                    "scan requires --cli-log-root, --chat-storage-root or --cli-history-db.",
+                    file=sys.stderr,
+                )
                 return 2
             scan_result = application.scan(
                 args.db,
-                args.cli_log_root,
-                args.chat_storage_root,
+                args.cli_log_roots or (),
+                args.chat_storage_roots or (),
                 full=args.full,
                 cli_history_db=args.cli_history_db,
             )
@@ -150,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
                         "scan_id": scan_result.scan_id,
                         "records_count": scan_result.records_count,
                         "diagnostics_count": scan_result.diagnostics_count,
+                        "history_warnings": scan_result.history_warnings,
                     },
                     sort_keys=True,
                 )

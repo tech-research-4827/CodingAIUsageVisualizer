@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from copilot_usage_visualizer.gui.settings import DashboardSettings
+from copilot_usage_visualizer.gui.settings_store import DashboardSettingsStore, SettingsStoreError
 
 
 # GUI 専用 CLI parser を構築する。
@@ -18,10 +19,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Open the Copilot usage Dear PyGui dashboard.",
     )
     parser.add_argument(
-        "--db", type=Path, help="SQLite DB path (default: output/copilot-usage.db)."
+        "--db", type=Path, help="Override saved DB path (unsaved: output/copilot-usage.db)."
     )
-    parser.add_argument("--cli-log-root", type=Path, help="Copilot CLI session-state root.")
-    parser.add_argument("--chat-storage-root", type=Path, help="VS Code workspaceStorage root.")
+    parser.add_argument(
+        "--cli-log-root",
+        dest="cli_log_roots",
+        action="append",
+        type=Path,
+        help="Copilot CLI session-state root (repeatable).",
+    )
+    parser.add_argument(
+        "--chat-storage-root",
+        dest="chat_storage_roots",
+        action="append",
+        type=Path,
+        help="VS Code workspaceStorage root (repeatable).",
+    )
     parser.add_argument("--output", type=Path, help="HTML report output path.")
     parser.add_argument("--from", dest="date_from", help="Initial start date YYYY-MM-DD.")
     parser.add_argument("--to", dest="date_to", help="Initial end date YYYY-MM-DD.")
@@ -30,16 +43,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # CLI 引数から settings を構築する。
-def build_settings(args: argparse.Namespace) -> DashboardSettings:
-    """既定値に任意の CLI 引数を上書きした DashboardSettings を構築する。"""
+def build_settings(
+    args: argparse.Namespace, store: DashboardSettingsStore | None = None,
+) -> DashboardSettings:
+    """既定値 → 保存値 → 明示引数の順で起動設定を構築する。"""
 
     settings = DashboardSettings.from_defaults()
+    resolved_store: DashboardSettingsStore = (
+        store if store is not None else DashboardSettingsStore()
+    )
+    messages: list[str] = []
+    try:
+        saved: DashboardSettings | None = resolved_store.load()
+        if saved is not None:
+            settings = saved
+            messages.append("Settings loaded.")
+    except SettingsStoreError as exc:
+        messages.append(str(exc))
     if args.db is not None:
         settings.db_path = args.db
-    if args.cli_log_root is not None:
-        settings.cli_log_root = args.cli_log_root
-    if args.chat_storage_root is not None:
-        settings.chat_storage_root = args.chat_storage_root
+    if args.cli_log_roots is not None:
+        settings.cli_log_roots = tuple(args.cli_log_roots)
+    if args.chat_storage_roots is not None:
+        settings.chat_storage_roots = tuple(args.chat_storage_roots)
     if args.output is not None:
         settings.report_output = args.output
     if args.date_from is not None:
@@ -48,6 +74,11 @@ def build_settings(args: argparse.Namespace) -> DashboardSettings:
         settings.date_to = args.date_to
     if args.usd_jpy_rate is not None:
         settings.usd_jpy_rate = args.usd_jpy_rate
+    try:
+        settings.validate()
+    except ValueError as exc:
+        messages.append(str(exc))
+    settings.startup_messages = tuple(messages)
     return settings
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from copilot_usage_visualizer.ingestion.copilot_cli_history import (
@@ -20,6 +20,50 @@ from copilot_usage_visualizer.normalization.usage import (
     RunSelectionPolicy,
     TokenBuckets,
 )
+
+
+# 累積期間の根拠を候補行とは別に保持し、後着の矛盾を過去へ遡及しない。
+@dataclass
+class _PrimaryModelEvidence:
+    """主モデルの一貫性と実使用の根拠だけを保持する。"""
+
+    # 選択・変更・実使用で一貫しているモデル。
+    model: str | None = None
+    # 選択情報だけでは推定を成立させない。
+    has_usage: bool = False
+    # 曖昧な累積区間は後続の単一名で回復しない。
+    ambiguous: bool = False
+    # 再開後に増加した総額を前区間の使用根拠だけで帰属させない。
+    resumed: bool = False
+    # 現在の再開区間に実使用のモデル根拠があるか。
+    segment_usage: bool = False
+    # 最後の有効な累積値と比較して、無使用の resume/exit を区別する。
+    last_total: int | None = None
+
+    # モデル名を検証し、累積期間全体の矛盾を記録する。
+    def observe(self, value: object, *, usage: bool = False) -> None:
+        """不正・異なるモデル名は推定を無効にする。"""
+        if not isinstance(value, str) or not value.strip():
+            self.ambiguous = True
+            return
+        if self.model is not None and self.model != value:
+            self.ambiguous = True
+        self.model = value
+        self.has_usage |= usage
+        self.segment_usage |= usage
+
+    # 累積値の増加に対応する再開区間の実使用根拠を確認する。
+    def select_total(self, total: int) -> None:
+        """再開後の増分に根拠がなければ累積全体の推定を止める。"""
+        if (self.resumed and not self.segment_usage
+                and (self.last_total is None or total > self.last_total)):
+            self.ambiguous = True
+        self.last_total = total
+
+    # その時点での根拠を候補に保存する。
+    def hint(self) -> str | None:
+        """実使用があり累積期間に矛盾がない場合だけ名を返す。"""
+        return self.model if self.has_usage and not self.ambiguous else None
 
 
 # Copilot CLI events.jsonl parser。
@@ -43,6 +87,7 @@ class CopilotCliEventsParser:
         last_timestamp: str | None = None
         unfinished: bool = False
         saw_lifecycle: bool = False
+        primary = _PrimaryModelEvidence()
         zero = TokenBuckets(0, 0, 0, 0, 0)
         with source_file_path.open("r", encoding="utf-8") as source_file:
             for line_number, line in enumerate(source_file, start=1):
@@ -51,6 +96,7 @@ class CopilotCliEventsParser:
                 try:
                     event: object = json.loads(line)
                 except json.JSONDecodeError:
+                    primary.ambiguous = True
                     diagnostics.append(
                         self._diagnostic(
                             source_file_path,
@@ -61,6 +107,7 @@ class CopilotCliEventsParser:
                     )
                     continue
                 if not isinstance(event, dict):
+                    primary.ambiguous = True
                     diagnostics.append(
                         self._diagnostic(
                             source_file_path,
@@ -77,10 +124,25 @@ class CopilotCliEventsParser:
                     "session.shutdown",
                     "session.usage_checkpoint",
                     "session.compaction_complete",
+                    "session.model_change",
+                    "assistant.message",
                 }:
                     continue
-                saw_lifecycle = True
                 payload = JsonObjectReader.object_value(event, "data") or {}
+                # 応答・選択メタデータの別session IDで直接使用量を除外しない。
+                if name == "assistant.message":
+                    agent_source = event if "agentId" in event else payload
+                    if "agentId" not in agent_source:
+                        primary.observe(payload.get("model"), usage=True)
+                    elif (not isinstance(agent_source["agentId"], str)
+                          or not agent_source["agentId"].strip()):
+                        primary.ambiguous = True
+                    continue
+                if name == "session.model_change":
+                    primary.observe(payload.get("previousModel"))
+                    primary.observe(payload.get("newModel"))
+                    continue
+                saw_lifecycle = True
                 identity = JsonObjectReader.string_value(payload, ("sessionId", "session_id"))
                 identity = identity or JsonObjectReader.string_value(
                     event, ("sessionId", "session_id")
@@ -115,6 +177,11 @@ class CopilotCliEventsParser:
                 if timestamp is not None:
                     last_timestamp = timestamp
                 if name in {"session.start", "session.resume"}:
+                    if "selectedModel" in payload or name == "session.resume":
+                        primary.observe(payload.get("selectedModel"))
+                    if name == "session.resume":
+                        primary.resumed = True
+                        primary.segment_usage = False
                     unfinished = True
                     continue
                 if timestamp is None:
@@ -150,12 +217,14 @@ class CopilotCliEventsParser:
                 if name == "session.usage_checkpoint":
                     unfinished = True
                     if total is not None:
+                        primary.select_total(total)
                         selected = [
                             replace(
                                 base,
                                 reported_nano_aiu=total,
                                 ai_credits_source=AiCreditsSource.CLI_CHECKPOINT,
                                 confidence="measured_from_usage_checkpoint",
+                                estimated_primary_model=primary.hint(),
                             )
                         ]
                     else:
@@ -179,6 +248,25 @@ class CopilotCliEventsParser:
                 )
                 rows = [replace(row, event_order=line_number) for row in rows]
                 metrics = JsonObjectReader.object_value(payload, "modelMetrics") or {}
+                if "modelMetrics" in payload and not isinstance(payload["modelMetrics"], dict):
+                    primary.ambiguous = True
+                if metrics:
+                    model = self._primary_model_hint(metrics)
+                    if model is None:
+                        primary.ambiguous = True
+                    else:
+                        # ゼロ内訳の終了名だけでは過去の使用を証明しない。
+                        has_usage = any(
+                            (row.reported_nano_aiu or 0) > 0
+                            or any(value > 0 for value in (
+                                row.token_buckets.raw_input_tokens,
+                                row.token_buckets.cached_input_tokens,
+                                row.token_buckets.cache_write_tokens,
+                                row.token_buckets.output_tokens,
+                            ))
+                            for row in rows
+                        )
+                        primary.observe(model, usage=has_usage)
                 token_rows = [
                     row for row in rows
                     if (self._has_tokens(metrics.get(row.model_key or ""))
@@ -193,9 +281,11 @@ class CopilotCliEventsParser:
                 )
                 model_total = sum(row.reported_nano_aiu or 0 for row in rows)
                 if complete and (total is None or total == model_total):
+                    primary.select_total(model_total)
                     selected = rows
                     unfinished = False
                 elif total is not None:
+                    primary.select_total(total)
                     selected = [
                         replace(
                             base,
@@ -203,13 +293,22 @@ class CopilotCliEventsParser:
                             reported_nano_aiu=total,
                             ai_credits_source=AiCreditsSource.CLI_SHUTDOWN_TOTAL,
                             confidence="measured_from_shutdown_total_nano_aiu",
-                            estimated_primary_model=self._primary_model_hint(metrics),
+                            estimated_primary_model=primary.hint(),
                         )
                     ]
                     unfinished = False
                 else:
                     unfinished = bool(selected)
 
+        if any(row.attribution_scope == "session_total"
+               and row.reported_nano_aiu is not None
+               and row.estimated_primary_model is None for row in selected):
+            diagnostics.append(self._diagnostic(
+                source_file_path,
+                "cli_primary_model_unresolved",
+                "Cumulative primary model evidence is missing, invalid or conflicting.",
+                None,
+            ))
         if saw_lifecycle and unfinished:
             diagnostics.append(
                 self._diagnostic(

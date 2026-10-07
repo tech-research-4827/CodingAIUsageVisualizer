@@ -1,15 +1,15 @@
-# Copilot Usage Visualizer
+# Coding AI Usage Visualizer
 
 Copilot CLI / VS Code Copilot Chat のローカルログと使用履歴DBから、使用量を集計するツールです。CLI、デスクトップGUI、オフラインHTML、JSON、Markdownで確認できます。
 
-公開repository名は **CodingAIUsageVisualizer** ですが、現在の対象は **GitHub Copilotのみ** です。製品名・Python package名・コマンド名はCopilot Usage Visualizerのままです。GitHubまたはMicrosoftの公式製品ではなく、両社による承認・保証・サポートを受けていません。
+製品名は **Coding AI Usage Visualizer** ですが、現在の解析対象は **GitHub Copilotのみ** です。Python package名（`copilot_usage_visualizer`）とコマンド名（`copilot-usage`、`copilot-usage-gui`）は従来のままです。GitHubまたはMicrosoftの公式製品ではなく、両社による承認・保証・サポートを受けていません。
 
 ## 前提環境
 
 - Pythonの導入条件：3.11以上。
 - 今回の導入・CLI/HTML検証対象：Apple M1（arm64）、macOS Tahoe 26.6.2、Python 3.14.7。
 - 他のOS・CPU・Python版は未検証です。Pythonの導入条件は、すべての組合せでの動作保証を意味しません。
-- GUIにはデスクトップの表示環境が必要です。公開候補のGUI実画面確認は公開前に行い、Release notesに結果を記載します。
+- GUIにはデスクトップの表示環境が必要です。公開候補のGUI実画面は公開前に確認し、Release notesには確認した環境を記載します。
 - 解析対象のCopilotログ・使用履歴DBがローカルに必要です。GitHubへのログインやAPI tokenを本ツールに渡す必要はありません。
 
 ## 導入
@@ -25,7 +25,7 @@ python -m pip install .
 copilot-usage --version
 ```
 
-Releaseのソースarchiveを使う場合は、展開したディレクトリでvenv作成から実行してください。版を固定して取得したい場合は、clone後に公開済みtag（初回は `v0.1.0`）へ切り替えてからinstallします。
+Releaseのソースarchiveを使う場合は、展開したディレクトリでvenv作成から実行してください。版を固定して取得したい場合は、clone後に公開済みtag（例：`v0.2.0`）へ切り替えてからinstallします。
 
 `requirements.txt` を使う場合もアプリ自体のinstallが必要です。
 
@@ -47,6 +47,21 @@ requirementsのみでは `copilot-usage` / `copilot-usage-gui` は登録され�
 | Copilot CLI使用履歴DB | `--cli-history-db` | `~/.copilot/session-store.db` |
 
 CLIログを指定し、履歴DBを省略すると、CLIログの親ディレクトリにある `session-store.db` を探します。明示指定した履歴DBが優先されます。CLIログ・Chat・履歴DBはいずれか一つからでも解析できます。VS Codeの派生版や独自の保存先を使う場合は実際の場所を指定してください。
+
+`--cli-log-root` と `--chat-storage-root` は繰り返し指定し、すべての入力を合算できます。
+履歴DBを省略した場合は各CLI rootの親から読みます。明示の `--cli-history-db` は、異なるCLI rootが0個または1個のときだけ使えます。
+存在しない・ディレクトリでないrootや、履歴DBと同じ実体の出力DBは保存前に拒否します。
+同じ入力pathは重複除去しますが、別のイベントファイルに同じCLI sessionがあれば集計から除外して診断します。
+通常scanは指定から外したrootの保存済みデータを保持し、全体読み直しは現在指定したすべての入力だけで再構築します。
+繰り返し指定は従来の「最後だけ有効」から「合算」に変わりました。
+
+WindowsからWSL内のCopilot CLIの記録も `--cli-log-root` に指定できます（`\\wsl.localhost\<distribution>\home\<user>\.copilot\session-state` または `\\wsl$\...` の形式）。
+履歴DBは共有越しに開かず、指定したdistribution内の `python3` から使用量の列だけを読み取り専用で取得します。
+WSL内にはPython 3.10以上と標準の `sqlite3` モジュールが必要です。WSL内へ本ツールを導入する必要はありません。
+取得は30秒で時間切れになります。停止中のWSLは読み取り時に起動するため、待ち時間が生じます。
+取得に失敗すると、scan結果JSONの `history_warnings` とGUIの実行Logに確認手順を表示し、`cli_history_wsl_` で始まる診断コードを記録します。
+明示した `--cli-history-db` を取得できない場合は保存前に失敗します。暗黙の履歴取得の失敗ではイベントの取り込みを続けますが、次に取得できるまで合計や日別内訳が変わり得ます。
+WSLの読み取りは公開前の検証対象（前提環境のmacOS）に含まれません。
 
 既定の解析DBは、**コマンドを実行したディレクトリを基準とする** `output/copilot-usage.db` です。インストール先基準ではありません。`--db` で変更できます。出力DBは本ツール専用の新しいファイルにしてください。
 
@@ -85,6 +100,21 @@ copilot-usage export-html --db output/copilot-usage.db \
 
 HTMLはJavaScriptとライセンス通知を一つのファイルに含み、CDNなしでブラウザ表示できます。JSONの `summary` と `report` は別の出力形式です。`report --detail` で明細を追加できます。
 
+複数の環境でそれぞれscanした解析DBは、新しいDBへ統合できます。
+
+```sh
+copilot-usage merge \
+  --input output/copilot-usage.db \
+  --input other/copilot-usage.db \
+  --output output/merged.db
+```
+
+`--input` は2個以上指定します。入力DBは読み取り専用で開き、本ツールの現行形式と構造が一致するものだけを受け付けます。
+既存ファイルや入力と同じファイルを出力に指定すると拒否し、追記・上書きはしません。出力先のディレクトリは事前に作成してください。
+複数の入力に同じsessionがある場合は、入力番号付きで報告します。CLIで両方の入力にイベントがあるsessionは集計から除外し、履歴だけが重なるsessionは未確定として加算しません。Chatの重なりは両方を加算します。
+統合DBはレポート用の派生物です。統合DBとその入力を再びmergeすると重複します。各環境で更新してから、改めて統合してください。
+入力にするDBは、scanやGUIで使用中のものを避け、使用を終えたものをコピーして使ってください。
+
 GUIは次で起動します。
 
 ```sh
@@ -92,6 +122,33 @@ copilot-usage-gui
 ```
 
 `copilot-usage gui` でも起動できます。設定欄で入力・解析DB・レポート出力先・期間・換算レートを確認してから、scan、表示更新、HTML exportを行います。既定の期間は起動月、換算レートは160です。GUIの設定が別の入力を指していないか、全体読み直し前にも確認してください。
+
+CLI・Chatの入力欄はそれぞれ1行1パスです。Explorerの「パスのコピー」で付く囲み引用符と前後空白を除き、空行は無視します。
+既定の場所が存在しない取得元は、入力欄が空欄で始まります。
+空欄はその取得元を無効にし、カレントディレクトリは読みません。行を削除して保存済みデータも除くには全体読み直しを使います。
+scanは同期処理のため、多数・低速のrootでは画面が操作待ちになる時間が延びる場合があります。
+
+「設定・アクション」タブの **設定を保存** で、入力・解析DB・レポート出力先・期間・換算レート・表示倍率（UI scale）・文字の大きさ（Font size）を保存し、次回の起動で復元します。
+scan・表示更新・HTML export・終了では自動保存しません。起動時は項目ごとに、明示した起動引数、保存した設定、既定値の順で使います。
+保存先は画面の「GUI 設定」欄（Settings file）に表示します。
+
+| OS | 設定ファイル |
+| --- | --- |
+| macOS | `~/Library/Application Support/CopilotUsageVisualizer/gui-settings.json` |
+| Windows | `%LOCALAPPDATA%\CopilotUsageVisualizer\gui-settings.json` |
+| Linux | `$XDG_CONFIG_HOME/CopilotUsageVisualizer/gui-settings.json`（未設定などの場合は `~/.config/` 配下） |
+
+設定ファイルには、入力・出力の絶対パスが平文で入ります。使用量データやログ本文は入りません。設定ファイルを共有しないでください。
+保存した期間は月が変わっても維持します。相対パスは保存時の作業ディレクトリを基準に絶対パスへ変換します。
+
+表示倍率と文字の大きさ（100 / 115 / 125 / 150%）は、保存後の次回起動から反映します。表示倍率の「自動」は、WindowsではOSの表示倍率を使い、macOS・Linuxでは100%です。WSLgでは100〜250%から選んで保存してください。
+大きくした結果、最小のウィンドウが画面に収まらない場合は、どちらかを下げてください。
+
+期間はYYYY-MM-DDの直接入力のほか、日付の選択と「先月」「今月」「今日」で変更できます。集計への反映は表示更新で行います。
+
+「セッション使用量」タブは、scanせずにCopilot CLIの記録を直接読み、一つのセッションのAI Credits・token・コンテキストの推移、エージェント別の内訳、監査詳細を表示します。
+CLIログ欄のrootの親（例：`~/.copilot`）にある使用履歴DB・セッションのイベントファイル・GitHub Copilotアプリの `data.db`（存在する場合）を読み取り専用で開き、読んだ内容を保存しません。
+自動更新（Auto refresh）は既定で無効です。WindowsからWSLの共有パスにある記録は、このタブでは読みません。解析DBや統合DBの内容の確認には使えません。
 
 ## 集計の意味と既知の制約
 
@@ -133,7 +190,7 @@ copilot-usage scan --full \
 
 ## データの扱い
 
-本ツールはローカルで解析し、解析結果を外部サービスへ送る機能を持ちません。入力ログ本文は読み取り時に処理しますが、raw prompt・response・tool output・元の絶対パスを解析DBやレポートに保存しない設計です。パスの代わりにhashと表示用aliasを使います。
+本ツールはローカルで解析し、解析結果を外部サービスへ送る機能を持ちません。入力ログ本文は読み取り時に処理しますが、raw prompt・response・tool output・元の絶対パスを解析DBやレポートに保存しない設計です。パスの代わりにhashと表示用aliasを使います。例外として、GUIの設定ファイルには利用者が設定欄に入力したパスを保存します（前述）。
 
 alias、モデル、日時、使用量から業務情報が分かることはあるため、DBやレポートの共有前に内容を確認してください。匿名化の完全性は保証しません。CopilotやVS Code自体の通信・同期設定は本ツールとは別です。
 
