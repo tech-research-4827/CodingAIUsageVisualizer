@@ -132,6 +132,9 @@ class SessionUsageTab:
         theme は構築済みの theme を返す (タブの構築は theme の構築後)。
         """
 
+        self._reads_paused: bool = False
+        # 再開時は「セッションなし」など、停止前の無効状態も復元する。
+        self._paused_enabled: dict[str, bool] = {}
         self._roots_source: Callable[[], tuple[Path, ...]] = roots
         self._log: Callable[[str], None] = log
         self._theme: Callable[[], DashboardThemeAssets] = theme
@@ -192,6 +195,9 @@ class SessionUsageTab:
     def on_tab_selected(self) -> None:
         """設定欄の CLI log root を読み直して表示する (root の変更はここと Refresh で反映)。"""
 
+        if self._reads_paused:
+            dpg.set_value("su_status", "Scan running; session refresh deferred.")
+            return
         self._reload_roots()
         self._load(force=False, sessions=True)
 
@@ -200,12 +206,33 @@ class SessionUsageTab:
         """描き直し後のスクロール位置の復元と、自動更新 (5 秒ごと、タブが前面の時だけ)。"""
 
         self._restore_scroll()
-        if not self.is_active() or not dpg.get_value("su_auto"):
+        if self._reads_paused or not self.is_active() or not dpg.get_value("su_auto"):
             return
         if time.monotonic() - self._state.last_check < self.AUTO_INTERVAL_SECONDS:
             return
         state: _TabState = self._state
         self._load(force=False, sessions=state.browser_open or state.session_id is None)
+
+    # scanの間は別経路の同期読み取りを保留し、描画を止めない。
+    def set_reads_paused(self, paused: bool) -> None:
+        """表示を維持したまま、セッション読み取り操作を一時停止する。"""
+
+        if paused == self._reads_paused:
+            return
+        self._reads_paused = paused
+        if paused:
+            self._paused_enabled = {
+                tag: bool(dpg.get_item_configuration(tag)["enabled"])
+                for tag in ("su_refresh", "su_root", "su_session")
+            }
+            for tag in self._paused_enabled:
+                dpg.configure_item(tag, enabled=False)
+            dpg.set_value("su_status", "Scan running; session refresh deferred.")
+        else:
+            for tag, enabled in self._paused_enabled.items():
+                dpg.configure_item(tag, enabled=enabled)
+            self._paused_enabled.clear()
+            dpg.set_value("su_status", "Scan finished. Refresh to update sessions.")
 
     # viewport の大きさが変わった時。
     def on_resize(self) -> None:
@@ -279,6 +306,9 @@ class SessionUsageTab:
     def _load(self, force: bool, sessions: bool) -> None:
         """force は記録の署名にかかわらず読み直す。読み取りの失敗は状態として表示する。"""
 
+        if self._reads_paused:
+            dpg.set_value("su_status", "Scan running; session refresh deferred.")
+            return
         state: _TabState = self._state
         state.last_check = time.monotonic()
         self._render_notice()

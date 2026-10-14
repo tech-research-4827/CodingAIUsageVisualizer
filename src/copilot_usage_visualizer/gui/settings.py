@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
+from copilot_usage_visualizer.app_paths import AppPaths
 from copilot_usage_visualizer.defaults import AppDefaults
 from copilot_usage_visualizer.gui.display_scale import FontSizeChoice, UiScaleChoice
 
@@ -70,7 +71,9 @@ class DashboardSettings:
     ) -> DashboardSettings:
         """AppDefaults と起動日から既定の設定を構築する。"""
 
-        resolved_defaults: AppDefaults = defaults if defaults is not None else AppDefaults()
+        resolved_defaults: AppDefaults = (
+            defaults if defaults is not None else AppDefaults(AppPaths().data_dir())
+        )
         resolved_today: date = today if today is not None else date.today()
         date_from, date_to = AppDefaults.month_range(resolved_today)
         cli_root: Path = resolved_defaults.cli_log_root()

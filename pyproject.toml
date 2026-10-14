@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "copilot-usage-visualizer"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local Copilot usage log scanner and report tool."
 requires-python = ">=3.11"
 readme = "README.md"
@@ -15,6 +15,9 @@ dependencies = ["dearpygui>=2.3,<3", "jinja2>=3.1", "plotly==6.8.0"]
 [project.scripts]
 copilot-usage = "copilot_usage_visualizer.cli:main"
 copilot-usage-gui = "copilot_usage_visualizer.gui_cli:main"
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.11"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/copilot_usage_visualizer"]

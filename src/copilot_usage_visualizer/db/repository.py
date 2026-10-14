@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from sqlite3 import Connection, Row
@@ -17,6 +18,7 @@ from copilot_usage_visualizer.normalization.credits import CliHistorySelection
 from copilot_usage_visualizer.normalization.usage import (
     CliHistorySnapshot,
     DiagnosticRecord,
+    FileScanState,
     ParsedHistoryInput,
     ParsedSourceFile,
     ParsedUsageRecord,
@@ -157,8 +159,32 @@ class HistoryReader:
     def initialize(self) -> None:
         """DB schema を初期化する。"""
 
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             self._migration_service.apply(connection)
+
+    # 過去のstatだけの記録は省略根拠にせず、成功transactionの状態だけ読む。
+    def scan_states(self) -> dict[tuple[str, str], str]:
+        """現行DBの読込状態を読み取り専用で返し、空・未作成DBは初回扱いにする。"""
+
+        if not self._db_path.exists() or self._db_path.stat().st_size == 0:
+            return {}
+        with closing(sqlite3.connect(
+            self._db_path.resolve().as_uri() + "?mode=ro", uri=True,
+        )) as connection:
+            connection.execute("BEGIN")
+            # 空DBでmigrationを起動するとread-only接続へDDLを試みるため先に判別する。
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+            ).fetchone() is None:
+                return {}
+            self._migration_service.apply(connection)
+            return {
+                (str(row[0]), str(row[1])): str(row[2])
+                for row in connection.execute(
+                    "SELECT source_type, path_hash, last_event_hash FROM source_files "
+                    "WHERE scan_status = 'ok' AND last_event_hash LIKE 'scan-v1:%'"
+                )
+            }
 
     # scan records と diagnostics を保存する。
     def store_scan(
@@ -177,7 +203,7 @@ class HistoryReader:
         受け取ってから reset するため、保存に失敗すれば rollback され既存データは保持される。
         """
 
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             self._migration_service.apply(connection, rebuild=full)
             if full:
                 self._reset_scan_data(connection)
@@ -205,6 +231,9 @@ class HistoryReader:
                 )
             for diagnostic in diagnostics:
                 self._insert_diagnostic(connection, scan_id, diagnostic)
+            # full時の空ファイルも含め、解析結果と成功状態を同じtransactionで確定する。
+            for source_file in source_files or []:
+                self._upsert_source_file(connection, source_file)
             self.refresh_selection_diagnostics(connection, scan_id)
             diagnostics_count = int(
                 connection.execute(
@@ -267,7 +296,7 @@ class HistoryReader:
     def report_records(self, date_from: str, date_to: str) -> list[UsageRow]:
         """全期間で照合してから日付で絞り、各frontendへ同じ採用射影を渡す。"""
         self.initialize()
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             selection = self._select_usage(connection)
         return sorted(
             [row for row in selection.rows
@@ -325,7 +354,7 @@ class HistoryReader:
         """全期間で重複を判定し、選択済み行が指定期間にあるsessionを数える。"""
 
         self.initialize()
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             row: Row = connection.execute(
                 f"""WITH {self._all_usage_cte()}
                 SELECT COUNT(*) AS count FROM (
@@ -390,10 +419,10 @@ class HistoryReader:
         files = {item.source_file_path: item for item in source_files}
         for record in records:
             if record.source == "copilot_cli":
-                files[record.source_file_path] = ParsedSourceFile(
+                files.setdefault(record.source_file_path, ParsedSourceFile(
                     "copilot_cli_history" if record.run_kind == RunKind.HISTORY else record.source,
                     record.source_file_path, record.source_file_display_alias
-                )
+                ))
         for item in files.values():
             source_id = self._upsert_source_file(connection, item)
             connection.execute("DELETE FROM usage_records WHERE source_file_id = ?", (source_id,))
@@ -413,7 +442,7 @@ class HistoryReader:
         """diagnostic code ごとの件数を返す。"""
 
         self.initialize()
-        with self.connect() as connection:
+        with closing(self.connect()) as connection, connection:
             return list(
                 connection.execute(
                     """
@@ -485,8 +514,10 @@ class HistoryReader:
         )
         source_path: Path = Path(record.source_file_path)
         path_hash: str = self._hash_text(str(source_path.resolve()))
-        mtime_ns: int = source_path.stat().st_mtime_ns if source_path.exists() else 0
-        size_bytes: int = source_path.stat().st_size if source_path.exists() else 0
+        # 後着の追記を処理済みにしない。保存時点のstatを成功状態として使わない。
+        state: FileScanState | None = (
+            record.scan_state if isinstance(record, ParsedSourceFile) else None
+        )
         connection.execute(
             """
             INSERT INTO source_files
@@ -495,19 +526,23 @@ class HistoryReader:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_type, path_hash) DO UPDATE SET
               display_alias = excluded.display_alias,
-              mtime_ns = excluded.mtime_ns,
-              size_bytes = excluded.size_bytes,
-              scan_status = excluded.scan_status
+              mtime_ns = CASE WHEN ? THEN excluded.mtime_ns ELSE source_files.mtime_ns END,
+              size_bytes = CASE WHEN ? THEN excluded.size_bytes ELSE source_files.size_bytes END,
+              last_offset = CASE WHEN ? THEN excluded.last_offset ELSE source_files.last_offset END,
+              last_event_hash = CASE WHEN ? THEN excluded.last_event_hash
+                                    ELSE source_files.last_event_hash END,
+              scan_status = CASE WHEN ? THEN excluded.scan_status ELSE source_files.scan_status END
             """,
             (
                 source_type,
                 path_hash,
                 record.source_file_display_alias,
-                mtime_ns,
-                size_bytes,
-                size_bytes,
-                self._hash_text(f"{mtime_ns}:{size_bytes}"),
-                "ok",
+                state.mtime_ns if state else 0,
+                state.size_bytes if state else 0,
+                state.size_bytes if state else 0,
+                state.fingerprint if state else None,
+                "ok" if state else "uncached",
+                *([isinstance(record, ParsedSourceFile)] * 5),
             ),
         )
         row: Row = connection.execute(
@@ -722,6 +757,12 @@ class HistoryReader:
         """diagnostic record を保存する。"""
 
         source_file_id: int = self._upsert_source_file(connection, diagnostic)
+        # metadata不変で復旧しても再読込し、読取不能の診断を残し続けない。
+        if diagnostic.source == "copilot_cli" and diagnostic.code == "source_unreadable":
+            connection.execute(
+                "UPDATE source_files SET scan_status = 'unreadable', last_event_hash = NULL "
+                "WHERE source_id = ?", (source_file_id,),
+            )
         connection.execute(
             """
             INSERT INTO diagnostics

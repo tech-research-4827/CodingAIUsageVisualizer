@@ -713,7 +713,7 @@ class DashboardLayout:
     # `text_row_height` / `heading_height` に対応する）。
     TAB_LAYOUTS: tuple[TabLayoutSpec, ...] = (
         TabLayoutSpec(
-            label="設定・アクション", fixed_height=676, residual_widget_tag="log_box",
+            label="設定・アクション", fixed_height=628, residual_widget_tag="log_box",
             font_lines=22.5,
         ),
         TabLayoutSpec(

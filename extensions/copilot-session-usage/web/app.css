@@ -1,0 +1,244 @@
+/* Session usage canvas. 色・文字は App の canvas theme 変数を使い、App 外で開いた時だけ fallback 値を使う。 */
+
+:root {
+    /* fallback (light)。App が注入する変数があればそちらが優先される。 */
+    --fb-bg: #ffffff;
+    --fb-border: #d0d7de;
+    --fb-text: #1f2328;
+    --fb-muted: #59636e;
+    --fb-focus: #0969da;
+    --fb-blue: #0969da;
+    --fb-green: #1a7f37;
+    --fb-orange: #bc4c00;
+    --fb-purple: #8250df;
+    --fb-red: #cf222e;
+    --fb-yellow: #9a6700;
+    --fb-gray: #6e7781;
+
+    /* 役割 token。画面は以下だけを参照する。 */
+    --c-bg: var(--background-color-default, var(--fb-bg));
+    /* 面の色は App の背景と文字色から作り、App の配色に追従させる。 */
+    --c-surface: color-mix(in srgb, var(--c-text) 5%, var(--c-bg));
+    --c-border: var(--border-color-default, var(--fb-border));
+    --c-text: var(--text-color-default, var(--fb-text));
+    --c-muted: var(--text-color-muted, var(--fb-muted));
+    --c-focus: var(--color-focus-outline, var(--fb-focus));
+    --c-accent: var(--true-color-blue, var(--fb-blue));
+    --c-warning: var(--true-color-yellow, var(--fb-yellow));
+    --c-error: var(--true-color-red, var(--fb-red));
+
+    /* グラフの系列色。凡例の文字と必ず併用する。 */
+    --series-credits: var(--true-color-blue, var(--fb-blue));
+    --series-input: var(--true-color-blue, var(--fb-blue));
+    --series-uncached: var(--true-color-blue, var(--fb-blue));
+    --series-cache-read: var(--true-color-green, var(--fb-green));
+    --series-cache-write: var(--true-color-orange, var(--fb-orange));
+    --series-output: var(--true-color-purple, var(--fb-purple));
+    --series-limit: var(--true-color-red, var(--fb-red));
+    --series-reference: var(--true-color-orange, var(--fb-orange));
+    --agent-1: var(--true-color-blue, var(--fb-blue));
+    --agent-2: var(--true-color-green, var(--fb-green));
+    --agent-3: var(--true-color-purple, var(--fb-purple));
+    --agent-4: var(--true-color-orange, var(--fb-orange));
+    --agent-5: var(--true-color-yellow, var(--fb-yellow));
+    --agent-6: var(--fb-gray);
+
+    --font-ui: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+    --font-num: var(--font-mono, "SFMono-Regular", Consolas, "Liberation Mono", monospace);
+    --text-body: var(--text-body-medium, 13px);
+    --leading-body: var(--leading-body-medium, 20px);
+    --text-small: 12px;
+    --text-tiny: 11px;
+    --text-title: 16px;
+    --text-value: 18px;
+    --weight-strong: var(--font-weight-semibold, 600);
+
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --radius-control: 6px;
+    --radius-panel: 8px;
+    /* ブラウザで単独起動した広い window での内容の最大幅。canvas の panel 幅 (900px 以下) には効かない。 */
+    --content-max: 1400px;
+
+    color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --fb-bg: #0d1117;
+        --fb-border: #30363d;
+        --fb-text: #e6edf3;
+        --fb-muted: #9198a1;
+        --fb-focus: #4493f8;
+        --fb-blue: #4493f8;
+        --fb-green: #3fb950;
+        --fb-orange: #db6d28;
+        --fb-purple: #ab7df8;
+        --fb-red: #f85149;
+        --fb-yellow: #d29922;
+        --fb-gray: #8b949e;
+    }
+}
+
+/* App が明示した配色を OS 設定より優先する。 */
+:root[data-color-mode="light"] { color-scheme: light; }
+:root[data-color-mode="dark"] { color-scheme: dark; }
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--c-bg);
+    color: var(--c-text);
+    font-family: var(--font-ui);
+    font-size: var(--text-body);
+    line-height: var(--leading-body);
+}
+
+h1, h2, h3 { margin: 0; font-weight: var(--weight-strong); }
+h1 { font-size: var(--text-title); }
+h2 { font-size: var(--text-body); }
+
+:focus-visible { outline: 2px solid var(--c-focus); outline-offset: 2px; }
+
+.visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
+}
+
+/* ツールバーは固定し、内容だけをスクロールさせる。 */
+.toolbar {
+    position: sticky; top: 0; z-index: 1;
+    display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+    background: var(--c-bg);
+    border-bottom: 1px solid var(--c-border);
+    user-select: none;
+}
+.controls { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; min-width: 0; }
+.field { flex: 1 1 220px; min-width: 0; }
+select, button {
+    font: inherit; color: var(--c-text); background: var(--c-bg);
+    border: 1px solid var(--c-border); border-radius: var(--radius-control);
+    padding: var(--space-1) var(--space-2); min-height: 28px;
+}
+select { width: 100%; min-width: 0; }
+input[type="search"], input[type="date"] {
+    font: inherit; color: var(--c-text); background: var(--c-bg);
+    border: 1px solid var(--c-border); border-radius: var(--radius-control);
+    padding: var(--space-1) var(--space-2); min-height: 28px; min-width: 0;
+}
+button { cursor: pointer; }
+button.primary { border-color: var(--c-accent); color: var(--c-accent); font-weight: var(--weight-strong); }
+button[aria-pressed="true"], button[aria-expanded="true"] { background: var(--c-accent); color: var(--c-bg); border-color: var(--c-accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+.check { display: inline-flex; align-items: center; gap: var(--space-1); white-space: nowrap; }
+.status { margin: 0; color: var(--c-muted); font-size: var(--text-small); }
+.status.error { color: var(--c-error); }
+
+/* セッション一覧はツールバーの下に開き、内容と一緒にスクロールする。 */
+.browser { display: block; padding: var(--space-3); border-bottom: 1px solid var(--c-border); }
+.browser[hidden] { display: none; }
+.browser > * + * { margin-top: var(--space-2); }
+.browser .table-wrap { max-height: min(60vh, 520px); overflow: auto; }
+.filters { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: end; }
+.filters label { display: grid; gap: 2px; color: var(--c-muted); font-size: var(--text-small); min-width: 0; }
+.filters .filter-text { flex: 1 1 200px; }
+.filters input { color: var(--c-text); font-size: var(--text-body); width: 100%; }
+th button.sort { all: unset; cursor: pointer; white-space: nowrap; }
+th button.sort:focus-visible, button.link:focus-visible { outline: 2px solid var(--c-focus); outline-offset: 1px; }
+button.link { all: unset; cursor: pointer; color: var(--c-accent); font-family: var(--font-num); text-decoration: underline; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: var(--c-surface); }
+tr.selected td { background: var(--c-surface); }
+tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--c-accent); }
+
+main { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-4); padding: var(--space-3); }
+
+/* 広い window では背景と区切り線を全幅に残し、内容だけを最大幅で中央に寄せる。 */
+@media (min-width: 901px) {
+    .toolbar, .browser, main {
+        padding-inline: max(var(--space-3), calc((100% - var(--content-max)) / 2));
+    }
+}
+.loading, .empty { color: var(--c-muted); margin: var(--space-2) 0; }
+.note { color: var(--c-muted); font-size: var(--text-small); margin: var(--space-1) 0 0; }
+
+/* 警告は色だけでなく先頭の語で種類を示す。 */
+.alerts { display: grid; gap: var(--space-1); margin: 0; padding: 0; list-style: none; }
+.alerts li { padding: var(--space-1) var(--space-2); border-left: 3px solid var(--c-warning); background: var(--c-surface); overflow-wrap: anywhere; }
+.alerts li.error { border-left-color: var(--c-error); }
+.alerts li.info { border-left-color: var(--c-border); }
+.alerts strong { font-weight: var(--weight-strong); }
+
+section { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2); min-width: 0; }
+.section-head { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: baseline; justify-content: space-between; }
+.section-head > * { min-width: 0; overflow-wrap: anywhere; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: var(--space-2); }
+.card { padding: var(--space-2) var(--space-3); border: 1px solid var(--c-border); border-radius: var(--radius-panel); min-width: 0; }
+.card .label { color: var(--c-muted); font-size: var(--text-small); }
+.card .value { font-family: var(--font-num); font-size: var(--text-value); font-weight: var(--weight-strong); line-height: 26px; overflow-wrap: anywhere; }
+.card .sub { color: var(--c-muted); font-size: var(--text-small); overflow-wrap: anywhere; }
+.card.primary-card { border-color: var(--c-accent); }
+
+.segmented { display: inline-flex; gap: 0; }
+.segmented button { border-radius: 0; }
+.segmented button:first-of-type { border-radius: var(--radius-control) 0 0 var(--radius-control); }
+.segmented button:last-of-type { border-radius: 0 var(--radius-control) var(--radius-control) 0; margin-left: -1px; }
+.chart-controls { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; color: var(--c-muted); font-size: var(--text-small); }
+
+.chart-block { border: 1px solid var(--c-border); border-radius: var(--radius-panel); padding: var(--space-2) var(--space-3); min-width: 0; overflow: hidden; }
+.chart-block h2 { margin-bottom: var(--space-1); }
+svg.chart { display: block; overflow: visible; }
+svg.chart:focus-visible { outline: 2px solid var(--c-focus); }
+.grid { stroke: var(--c-border); stroke-width: 1; opacity: 0.6; }
+.axis { stroke: var(--c-muted); stroke-width: 1; }
+.axis-label { fill: var(--c-muted); font-size: var(--text-tiny); font-family: var(--font-num); }
+.line { fill: none; stroke: var(--stroke); stroke-width: 1.75; }
+.line.dashed { stroke-dasharray: 5 4; }
+.dot, .marker { fill: var(--fill); }
+.marker { stroke: var(--c-bg); stroke-width: 1; }
+.bar { fill: var(--fill); }
+.cursor { stroke: var(--c-muted); stroke-width: 1; stroke-dasharray: 2 2; }
+.readout { min-height: 20px; color: var(--c-text); font-family: var(--font-num); font-size: var(--text-small); overflow-wrap: anywhere; }
+.legend { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-3); margin: var(--space-1) 0 0; padding: 0; list-style: none; font-size: var(--text-small); }
+.legend li { display: inline-flex; align-items: center; gap: var(--space-1); min-width: 0; overflow-wrap: anywhere; }
+.swatch { display: inline-block; width: 14px; height: 3px; background: var(--swatch); flex: none; }
+.swatch.dashed { background: repeating-linear-gradient(90deg, var(--swatch) 0 4px, transparent 4px 7px); }
+.swatch.marker { width: 8px; height: 8px; transform: rotate(45deg); }
+
+/* 表は自分の領域内で横スクロールする。 */
+.table-wrap { overflow-x: auto; border: 1px solid var(--c-border); border-radius: var(--radius-panel); }
+table { border-collapse: collapse; width: 100%; font-size: var(--text-small); }
+th, td { padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--c-border); text-align: left; white-space: nowrap; }
+th { color: var(--c-muted); font-weight: var(--weight-strong); background: var(--c-surface); position: sticky; top: 0; }
+td.num, th.num { text-align: right; font-family: var(--font-num); }
+td.name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+tr:last-child td { border-bottom: none; }
+tr.total td { font-weight: var(--weight-strong); }
+.tag { display: inline-block; padding: 0 var(--space-1); border: 1px solid var(--c-border); border-radius: var(--radius-control); color: var(--c-muted); font-size: var(--text-tiny); line-height: 16px; margin-left: var(--space-1); }
+.flag { color: var(--c-warning); font-weight: var(--weight-strong); }
+
+details { border: 1px solid var(--c-border); border-radius: var(--radius-panel); padding: var(--space-2) var(--space-3); }
+details > summary { cursor: pointer; font-weight: var(--weight-strong); user-select: none; }
+details[open] > summary { margin-bottom: var(--space-2); }
+/* grid にすると WebKit が折りたたみを開いた時に表の横スクロールバー分の高さを確保せず、最終行が隠れる。 */
+details .content { display: block; min-width: 0; }
+details .content > * + * { margin-top: var(--space-2); }
+.pager { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; font-size: var(--text-small); color: var(--c-muted); }
+dl.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px var(--space-3); margin: 0; font-size: var(--text-small); }
+dl.facts dt { color: var(--c-muted); }
+dl.facts dd { margin: 0; overflow-wrap: anywhere; font-family: var(--font-num); }
+
+.error-panel { border: 1px solid var(--c-error); border-radius: var(--radius-panel); padding: var(--space-3); display: grid; gap: var(--space-2); justify-items: start; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* 読み取り元 (source) の設定欄 */
+.source-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.source-row { display: flex; gap: var(--space-2); align-items: start; justify-content: space-between; min-width: 0; }
+.source-info { min-width: 0; flex: 1 1 auto; }
+.source-path { color: var(--c-muted); font-family: var(--font-num); font-size: var(--text-small); overflow-wrap: anywhere; }
+#sources-message.error { color: var(--c-error); }

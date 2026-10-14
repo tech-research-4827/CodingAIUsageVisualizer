@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
@@ -31,10 +31,12 @@ from copilot_usage_visualizer.gui.layout import (
     TableRenderPlan,
     TableSpec,
 )
+from copilot_usage_visualizer.gui.scan_job import ScanCompleted, ScanFailed, ScanJob
 from copilot_usage_visualizer.gui.session_usage_view import SessionUsageTab
 from copilot_usage_visualizer.gui.settings import DashboardSettings
 from copilot_usage_visualizer.gui.settings_store import DashboardSettingsStore, SettingsStoreError
 from copilot_usage_visualizer.gui.theme import DashboardTheme, DashboardThemeAssets, DpgItem
+from copilot_usage_visualizer.ingestion.scan_progress import ScanPhase, ScanProgress
 
 
 # Dear PyGui dashboard の描画を担当する。
@@ -54,25 +56,33 @@ class DashboardView:
         "btn_save_settings",
     )
 
+    # 実行対象と表示期間が食い違わないよう、scan中は全設定入力を固定する。
+    _SCAN_INPUT_TAGS: tuple[str, ...] = (
+        "in_db_path", "in_report_output", "in_cli_log_roots", "in_chat_storage_roots",
+        "in_date_from", "in_date_to", "in_usd_jpy_rate", "in_ui_scale", "in_font_size",
+        "btn_pick_date_from", "btn_pick_date_to", "btn_period_last_month",
+        "btn_period_this_month", "btn_period_today",
+    )
+
     # ウィンドウ名。製品名に合わせる (package・command 名は従来のまま)。
     _WINDOW_TITLE: str = "Coding AI Usage Visualizer"
 
     # 以下の幅・高さは 100% の設計値。描画時に表示倍率を掛ける (`_px`)。
     # 設定欄の title 列幅。最長 label が 18px font で収まる幅にする。
-    _LABEL_COLUMN_WIDTH: int = 260
+    _LABEL_COLUMN_WIDTH: int = 244
     # 日付入力の幅。YYYY-MM-DD の 10 文字に合わせる。
-    _DATE_INPUT_WIDTH: int = 140
+    _DATE_INPUT_WIDTH: int = 120
     # rate 入力の幅。dearpygui は step button 分も width に含めるため、
     # 値の表示幅（"160.00"）と -/+ button の合計を確保する。
     _RATE_INPUT_WIDTH: int = 160
     # 期間行で日付入力と一括指定 button の間に置く余白。
-    _PERIOD_PRESET_GAP: int = 16
+    _PERIOD_PRESET_GAP: int = 8
     # 表示倍率の選択欄の幅。"自動 (250%)" が収まる幅にする。
-    _UI_SCALE_COMBO_WIDTH: int = 160
+    _UI_SCALE_COMBO_WIDTH: int = 136
     # 文字の大きさの選択欄の幅。"150%" と選択 button が収まる幅にする。
-    _FONT_SIZE_COMBO_WIDTH: int = 84
+    _FONT_SIZE_COMBO_WIDTH: int = 76
     # 表示倍率・文字の大きさの行で部品の間に置く余白。最小幅でも文字 150% で収まる幅にする。
-    _DISPLAY_GAP: int = 12
+    _DISPLAY_GAP: int = 8
     # 表示倍率・文字の大きさの行に常に表示する、再起動が必要な旨。短くして最小幅でも見切れない
     # ようにし、全文は tooltip と保存時の Log に出す。
     _RESTART_NOTE: str = "Restart to apply"
@@ -100,6 +110,11 @@ class DashboardView:
             settings_store if settings_store is not None else DashboardSettingsStore()
         )
         self._pending: tuple[str, Callable[[], None]] | None = None
+        # GUIは子の終了を待たず、次のframeで進捗と終了を確認する。
+        self._scan_job = ScanJob()
+        self._scan_name: str | None = None
+        self._display_pending: ScanCompleted | None = None
+        self._closing: bool = False
         self._theme: DashboardThemeAssets | None = None
         # 起動時に確定する表示倍率。変更の保存は次回起動で反映する。
         self._display_scale: DisplayScale | None = None
@@ -129,6 +144,7 @@ class DashboardView:
             self._settings.ui_scale_percent, DisplayScaleResolver.detect_system_percent()
         )
         dpg.create_context()
+        dpg.configure_app(manual_callback_management=True)
         self._theme = DashboardTheme.build(
             self._display_scale.factor, self._settings.font_size_percent / 100
         )
@@ -139,6 +155,7 @@ class DashboardView:
         )
         dpg.create_viewport(
             title=self._WINDOW_TITLE,
+            disable_close=True,
             width=self._px(self._VIEWPORT_WIDTH),
             height=self._px(self._VIEWPORT_HEIGHT + growth),
             min_width=self._px(self._VIEWPORT_MIN_WIDTH),
@@ -150,12 +167,17 @@ class DashboardView:
         self._apply_residual_heights()
         self._session_tab.on_resize()
         dpg.set_viewport_resize_callback(self._on_viewport_resize)
+        dpg.set_exit_callback(self._on_close)
         self._log_degraded_modes()
         for message in self._settings.startup_messages:
             self._log(message)
         self._initial_load()
-        self._event_loop()
-        dpg.destroy_context()
+        try:
+            self._event_loop()
+        finally:
+            # 描画の例外でも親端点を閉じ、保存前の処理が裏で続くのを防ぐ。
+            self._scan_job.disconnect()
+            dpg.destroy_context()
 
     # 残余消費 widget の高さを適用する。
     def _apply_residual_heights(self) -> None:
@@ -163,10 +185,19 @@ class DashboardView:
 
         heights: dict[str, int] = TabLayoutSpec.residual_heights(
             DashboardLayout.TAB_LAYOUTS,
-            dpg.get_viewport_height(),
+            dpg.get_viewport_height() - self._footer_height(),
             self._theme_assets().scale,
             self._theme_assets().font_factor,
         )
+        content_height: int = max(
+            self._px(DashboardTheme.STATUS_HEIGHT),
+            dpg.get_viewport_client_height()
+            - self._footer_height()
+            - self._px(DashboardTheme.WINDOW_PADDING[1]
+                       + DashboardTheme.STATUS_BOTTOM_PADDING + DashboardTheme.ITEM_SPACING[1]),
+        )
+        dpg.configure_item("dashboard_content", height=content_height)
+        dpg.configure_item("scan_footer", height=self._footer_height())
         for tag, height in heights.items():
             dpg.configure_item(tag, height=height)
         # ネストした panel の余白を引き、viewport resize にも追従させる。
@@ -197,6 +228,19 @@ class DashboardView:
         self._apply_residual_heights()
         self._session_tab.on_resize()
 
+    # 固定高の見積りで残る空白は、描画済みLogの残余領域へ吸収する。
+    def _fit_log_height(self) -> None:
+        """可視Logだけを実測で伸縮し、最低実用高と内側scrollを保つ。"""
+
+        state = dpg.get_item_state("log_box")
+        if not state.get("visible") or "rect_size" not in state:
+            return
+        current: float = state["rect_size"][1]
+        remaining: float = state["content_region_avail"][1]
+        height: int = max(self._px(TabLayoutSpec.MIN_RESIDUAL_HEIGHT), round(current + remaining))
+        if height != round(current):
+            dpg.configure_item("log_box", height=height)
+
     # degraded mode を Log へ出す。
     def _log_degraded_modes(self) -> None:
         """font 未解決による degraded mode を無言にせず Log へ出力する。"""
@@ -204,27 +248,135 @@ class DashboardView:
         for message in self._theme_assets().degraded_messages():
             self._log(message)
 
-    # render loop を回す。
+    # render loopはscanを開始するだけで、その完了を同期に待たない。
     def _event_loop(self) -> None:
-        """frame を描画し、pending action を実行する manual loop。"""
+        """callbackと進捗反映を描画threadに統一するmanual loop。"""
 
         while dpg.is_dearpygui_running():
             dpg.render_dearpygui_frame()
+            self._fit_log_height()
+            dpg.run_callbacks(dpg.get_callback_queue())
             self._release_daily_axis_lock()
             self._session_tab.on_frame()
+            self._poll_scan()
+            if self._closing and not self._scan_job.active:
+                dpg.stop_dearpygui()
+                continue
             if self._pending is None:
                 continue
-            # 無効化したボタンと開始 Log を 1 frame 描画してから実行する。
+            # 無効化と開始Logを一度表示してから操作する。
             dpg.render_dearpygui_frame()
             name, worker = self._pending
+            self._pending = None
             try:
                 worker()
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 self._log(f"{name} error: {exc}")
+                if name.startswith("scan"):
+                    self._scan_name = name
+                    self._finish_scan("could not start. See Log.")
             finally:
-                self._pending = None
-                self._set_buttons_enabled(True)
-                self._log(f"{name}: 終了")
+                if not self._scan_job.active:
+                    self._set_buttons_enabled(True)
+                    if not name.startswith("scan"):
+                        self._log(f"{name}: 終了")
+
+    # footerは各タブのスクロールの外に置く。
+    def _footer_height(self) -> int:
+        """文字の大きさに連動するステータスバーの実寸を返す。"""
+
+        return (self._fpx(DashboardTheme.STATUS_BAR_HEIGHT)
+                + self._px(2 * DashboardTheme.CELL_PADDING[1]))
+
+    # 状態文はbarから独立させ、100%でも文字が右端へ押し出されないようにする。
+    def _set_scan_status(self, text: str, fraction: float) -> None:
+        """全タブ共通のscan状態を更新する。"""
+
+        dpg.set_value("scan_status", text)
+        dpg.set_value("scan_progress", fraction)
+        unknown_total: bool = self._scan_job.active and self._scan_job.progress.total is None
+        overlay: str = "..." if unknown_total else f"{fraction:.0%}"
+        dpg.configure_item("scan_progress", overlay=overlay)
+
+    # closeを横取りして、子の確定まで最後の状態を表示し続ける。
+    def _on_close(self, *_args: object) -> None:
+        """描画を止めずにscanの終了を要求する。"""
+
+        self._closing = True
+        self._scan_job.request_close()
+        self._pending = None
+        self._set_buttons_enabled(False)
+        if not self._scan_job.active:
+            dpg.stop_dearpygui()
+
+    # 子の通知を取り出すだけの処理を毎frame行う。
+    def _poll_scan(self) -> None:
+        """結果は子の終了後にだけ反映し、その前に更新中のframeを表示する。"""
+
+        if self._scan_name is None:
+            return
+        self._scan_job.poll()
+        progress: ScanProgress = self._scan_job.progress
+        if self._closing:
+            reason: str = {
+                ScanPhase.DISCOVERING: "waiting for discovery",
+                ScanPhase.HISTORY: "waiting for history read",
+                ScanPhase.READING: "waiting for current files",
+                ScanPhase.NORMALIZING: "waiting for normalization",
+                ScanPhase.SAVING: "waiting for database save",
+                ScanPhase.REPORT: "waiting for report load",
+            }[progress.phase]
+            self._set_scan_status(f"Closing: {reason}...", progress.fraction)
+            return
+        if self._scan_job.active:
+            reading: bool = progress.phase in (ScanPhase.HISTORY, ScanPhase.READING)
+            count: str = "" if progress.total is None or not reading else (
+                f" {progress.completed:,} / {progress.total:,} ({progress.fraction:.0%})"
+            )
+            if not reading and progress.total is not None:
+                count = " (reading finished)"
+            self._set_scan_status(f"Scan: {progress.phase.value}{count}", progress.fraction)
+            return
+        if self._display_pending is not None:
+            completed: ScanCompleted = self._display_pending
+            self._display_pending = None
+            try:
+                self._render_loaded_report(completed.report)
+                self._log("scan:\n" + self._pretty({
+                    "records_count": completed.stored.records_count,
+                    "diagnostics_count": completed.stored.diagnostics_count,
+                    "history_warnings": completed.stored.history_warnings,
+                    "scan_id": completed.stored.scan_id,
+                    "elapsed_seconds": round(self._scan_job.elapsed, 3),
+                    "worker_seconds": round(completed.elapsed, 3),
+                    "phase_seconds": {timing.phase.value: round(timing.seconds, 3)
+                                      for timing in completed.timings},
+                }))
+                self._finish_scan("complete. Database saved.", complete=True)
+            except (OSError, ValueError, RuntimeError):
+                self._log("scan: Database saved; display update failed. Retry GUI report refresh.")
+                self._finish_scan("database saved; display failed. See Log.")
+            return
+        outcome = self._scan_job.outcome
+        if isinstance(outcome, ScanCompleted):
+            self._display_pending = outcome
+            self._set_scan_status("Scan: Updating display...", progress.fraction)
+        elif isinstance(outcome, ScanFailed):
+            self._log(f"scan error: {outcome.message}")
+            self._finish_scan(f"failed: {outcome.label}. See Log.")
+
+    # 子の終了と表示反映が両方終わった時だけ操作を再許可する。
+    def _finish_scan(self, outcome: str, complete: bool = False) -> None:
+        """他の操作の結果と混同しない、最後のscan結果を残す。"""
+
+        timestamp: str = datetime.now().strftime("%H:%M:%S")
+        fraction: float = 1.0 if complete else self._scan_job.progress.fraction
+        self._set_scan_status(f"Last scan {timestamp}: {outcome}", fraction)
+        self._log(f"{self._scan_name}: 終了")
+        self._scan_name = None
+        self._scan_job.outcome = None
+        self._set_buttons_enabled(True)
+        self._session_tab.set_reads_paused(False)
 
     # daily plot の軸 lock を解除する。
     def _release_daily_axis_lock(self) -> None:
@@ -297,14 +449,63 @@ class DashboardView:
     def _build_layout(self) -> None:
         """primary window とタブを構築する。"""
 
-        with DpgSupport.context(dpg.window(tag="primary_window")):
-            with DpgSupport.context(dpg.tab_bar(callback=self._on_tab_changed)):
-                self._build_settings_tab()
-                self._build_diagnostics_tab()
-                self._build_model_tab()
-                self._build_daily_tab()
-                self._build_detail_tab()
-                self._session_tab.build()
+        with DpgSupport.context(dpg.window(tag="primary_window", no_scrollbar=True)):
+            # 上・左右の余白を保ち、ステータスバーの下だけ小さな余白にする。
+            with DpgSupport.context(dpg.theme()) as window_theme:
+                with DpgSupport.context(dpg.theme_component(dpg.mvAll)):
+                    dpg.add_theme_style(
+                        dpg.mvStyleVar_WindowPadding,
+                        self._px(DashboardTheme.WINDOW_PADDING[0]),
+                        self._px(DashboardTheme.STATUS_BOTTOM_PADDING),
+                    )
+            dpg.bind_item_theme("primary_window", window_theme)
+            dpg.add_spacer(height=self._px(
+                DashboardTheme.WINDOW_PADDING[1] - DashboardTheme.STATUS_BOTTOM_PADDING
+                - DashboardTheme.ITEM_SPACING[1]
+            ))
+            with DpgSupport.context(dpg.child_window(
+                tag="dashboard_content", border=False, no_scrollbar=True,
+                no_scroll_with_mouse=True, width=-1,
+            )) as content:
+                # wrapperの追加で既存tabに余白を重ねない。
+                with DpgSupport.context(dpg.theme()) as compact_theme:
+                    with DpgSupport.context(dpg.theme_component(dpg.mvAll)):
+                        dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
+                dpg.bind_item_theme(content, compact_theme)
+                # tab内の既存childには従来のpaddingを戻し、wrapperのstyleを漏らさない。
+                with DpgSupport.context(dpg.theme()) as tab_theme:
+                    with DpgSupport.context(dpg.theme_component(dpg.mvAll)):
+                        dpg.add_theme_style(
+                            dpg.mvStyleVar_WindowPadding,
+                            *map(self._px, DashboardTheme.WINDOW_PADDING),
+                        )
+                with DpgSupport.context(dpg.tab_bar(callback=self._on_tab_changed)) as tabs:
+                    dpg.bind_item_theme(tabs, tab_theme)
+                    self._build_settings_tab()
+                    self._build_diagnostics_tab()
+                    self._build_model_tab()
+                    self._build_daily_tab()
+                    self._build_detail_tab()
+                    self._session_tab.build()
+            with DpgSupport.context(dpg.child_window(
+                tag="scan_footer", border=False, no_scrollbar=True, width=-1,
+                height=self._footer_height(),
+            )) as footer:
+                dpg.bind_item_theme(footer, compact_theme)
+                with DpgSupport.context(dpg.table(
+                    header_row=False, width=-1, policy=dpg.mvTable_SizingStretchProp,
+                )):
+                    dpg.add_table_column(width_stretch=True)
+                    dpg.add_table_column(
+                        width_fixed=True,
+                        init_width_or_weight=self._px(DashboardTheme.STATUS_PROGRESS_WIDTH),
+                    )
+                    with DpgSupport.context(dpg.table_row()):
+                        dpg.add_text("Scan: idle", tag="scan_status")
+                        dpg.add_progress_bar(
+                            tag="scan_progress", default_value=0.0, width=-1,
+                            height=self._fpx(DashboardTheme.STATUS_BAR_HEIGHT), overlay="0%",
+                        )
         self._build_date_picker_popup()
 
     # タブが切り替わった時。
@@ -335,7 +536,6 @@ class DashboardView:
                 self._form_group("GUI 設定", self._add_gui_setting_rows)
                 self._add_gui_setting_tooltips()
                 self._build_action_buttons()
-                dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
                 self._heading("Log:")
                 dpg.add_input_text(
                     tag="log_box",
@@ -499,6 +699,8 @@ class DashboardView:
     def _on_pick_date(self, sender: DpgItem, _app_data: object, target: str) -> None:
         """入力欄の日付 (不正なら今日) で date picker を開き、書き込み先を覚える。"""
 
+        if self._pending is not None or self._scan_name is not None or self._closing:
+            return
         self._picker_target = target
         dpg.set_value(
             "date_picker",
@@ -513,6 +715,8 @@ class DashboardView:
     def _on_date_picked(self, _sender: DpgItem, app_data: object) -> None:
         """選んだ日を入力欄へ書き込んで閉じる。集計は「GUI report 更新」で反映する。"""
 
+        if self._pending is not None or self._scan_name is not None or self._closing:
+            return
         target: str | None = self._picker_target
         dpg.configure_item("date_picker_popup", show=False)
         if target is None:
@@ -528,6 +732,8 @@ class DashboardView:
     ) -> None:
         """開始・終了の入力欄だけを変える (ユーザーの選択: 自動では再集計しない)。"""
 
+        if self._pending is not None or self._scan_name is not None or self._closing:
+            return
         date_from, date_to = preset(date.today())
         dpg.set_value("in_date_from", date_from)
         dpg.set_value("in_date_to", date_to)
@@ -759,7 +965,7 @@ class DashboardView:
             )
             dpg.add_table_column(width_stretch=True)
             add_rows()
-        dpg.add_spacer(height=self._px(DashboardTheme.GROUP_SPACER_HEIGHT))
+        dpg.add_spacer(height=self._px(DashboardTheme.FORM_GROUP_SPACER_HEIGHT))
 
     # form の path 行を追加する。
     def _form_path_row(self, label: str, tag: str, value: object) -> None:
@@ -824,6 +1030,12 @@ class DashboardView:
 
         for tag in self._ACTION_BUTTON_TAGS:
             dpg.configure_item(tag, enabled=enabled)
+        for tag in self._SCAN_INPUT_TAGS:
+            dpg.configure_item(tag, enabled=enabled)
+        if not enabled:
+            # date pickerはenabled属性を持たないので、予約済みpopupを閉じる。
+            dpg.configure_item("date_picker_popup", show=False)
+            self._picker_target = None
 
     # Log に追記する。
     def _log(self, message: str) -> None:
@@ -842,7 +1054,7 @@ class DashboardView:
     def _request_action(self, name: str, worker: Callable[[], None]) -> None:
         """二重実行を防ぎつつ action を予約し、ボタンを無効化する。"""
 
-        if self._pending is not None:
+        if self._pending is not None or self._scan_name is not None or self._closing:
             self._log(f"{name}: 実行中のため無視しました")
             return
         try:
@@ -908,23 +1120,14 @@ class DashboardView:
 
         self._request_action("report HTML export", self._do_export)
 
-    # scan を実行する。
+    # scanは起動だけ行い、描画loopで完了をpollする。
     def _do_scan(self, full: bool) -> None:
-        """scan を実行し、結果を Log に出して再描画する。"""
+        """設定snapshotのscanを別プロセスで開始する。"""
 
-        result = self._data.rescan(self._settings, full=full)
-        self._log(
-            "scan:\n"
-            + self._pretty(
-                {
-                    "records_count": result.records_count,
-                    "diagnostics_count": result.diagnostics_count,
-                    "history_warnings": result.history_warnings,
-                    "scan_id": result.scan_id,
-                }
-            )
-        )
-        self._load_and_render()
+        self._scan_job.start(self._settings, full)
+        self._scan_name = "scan (全体読み直し)" if full else "scan (差分のみ)"
+        self._session_tab.set_reads_paused(True)
+        self._set_scan_status("Scan: Discovering inputs...", 0.0)
 
     # export を実行する。
     def _do_export(self) -> None:
@@ -942,9 +1145,15 @@ class DashboardView:
         """
 
         loaded = self._data.load(self._settings)
+        self._render_loaded_report(self._as_dict(loaded["report"]))
+
+    # データ取得はscanプロセス内で行い、GUIでは描画計画だけを作る。
+    def _render_loaded_report(self, report: dict[str, object]) -> None:
+        """取得済みreportからplanを構築し、成功した時だけ表示へ反映する。"""
+
         started: float = time.perf_counter()
         plan: DashboardRenderPlan = DashboardRenderPlan.build(
-            report=self._as_dict(loaded["report"]),
+            report=report,
             table_specs=DashboardLayout.TABLE_SPECS,
             numeric_alignment=self._theme_assets().numeric_alignment,
             date_from=self._settings.date_from,

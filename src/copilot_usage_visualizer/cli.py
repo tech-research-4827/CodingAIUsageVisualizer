@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -111,7 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
         "gui", help="Open the desktop dashboard (see also: copilot-usage-gui)."
     )
     gui_parser.add_argument(
-        "--db", type=Path, help="Override saved DB path (unsaved: output/copilot-usage.db)."
+        "--db", type=Path,
+        help="Override saved DB path (unsaved: per-user data/output/copilot-usage.db)."
     )
     gui_parser.add_argument(
         "--cli-log-root",
@@ -149,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI command を実行し exit code を返す。"""
 
     parser = build_parser()
+    multiprocessing.freeze_support()
     args = parser.parse_args(argv)
     application = UsageApplication()
 

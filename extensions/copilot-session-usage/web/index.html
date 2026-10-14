@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Session usage</title>
+    <link rel="stylesheet" href="app.css">
+    <script type="module" src="app.mjs"></script>
+</head>
+<body>
+    <header class="toolbar">
+        <h1>Session usage</h1>
+        <div class="controls">
+            <label class="field">
+                <span class="visually-hidden">Session</span>
+                <select id="session-select" aria-label="Session"></select>
+            </label>
+            <button id="sessions-toggle" type="button" aria-expanded="false" aria-controls="session-browser">Sessions</button>
+            <button id="sources-toggle" type="button" aria-expanded="false" aria-controls="sources-panel" hidden>Sources</button>
+            <button id="refresh" type="button" class="primary">Refresh</button>
+            <label class="check"><input id="auto" type="checkbox" checked> Auto refresh</label>
+        </div>
+        <p id="status" class="status" role="status" aria-live="polite">Loading…</p>
+    </header>
+    <section id="sources-panel" class="browser" aria-labelledby="sources-title" hidden>
+        <h2 id="sources-title">Sources</h2>
+        <p class="note">Each source is a Copilot home (a <code>.copilot</code> folder). Sessions of all sources are listed together. The saved list is shared by the canvas and the standalone page.</p>
+        <div id="sources-list"></div>
+        <form id="source-form" class="filters" autocomplete="off">
+            <label class="filter-text">Add a Copilot home
+                <input id="source-path" type="text" placeholder="Absolute path, e.g. \\wsl.localhost\Ubuntu-22.04\home\you\.copilot" spellcheck="false">
+            </label>
+            <button id="source-add" type="submit" class="primary">Add</button>
+        </form>
+        <p id="sources-message" class="note" role="status" aria-live="polite"></p>
+    </section>
+    <section id="session-browser" class="browser" aria-labelledby="browser-title" hidden>
+        <h2 id="browser-title">Sessions</h2>
+        <div class="filters">
+            <label class="filter-text">Filter
+                <input id="browser-q" type="search" placeholder="ID, repository, branch" autocomplete="off" spellcheck="false">
+            </label>
+            <label>From <input id="browser-from" type="date"></label>
+            <label>To <input id="browser-to" type="date"></label>
+            <button id="browser-clear" type="button">Clear</button>
+        </div>
+        <div id="browser-results"></div>
+    </section>
+    <main id="content" aria-busy="true">
+        <p class="loading">Loading session usage…</p>
+    </main>
+</body>
+</html>

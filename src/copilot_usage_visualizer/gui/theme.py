@@ -94,8 +94,16 @@ class DashboardTheme:
     # group 間の区切り余白。group 内の行間（ITEM_SPACING.y）より大きくする（P2）。
     GROUP_SPACER_HEIGHT: int = 8
 
+    # 設定欄だけの余白を詰め、最小画面でfooterぶんの領域を確保する。
+    FORM_GROUP_SPACER_HEIGHT: int = 4
+    # 全タブ共通の1行footer。文字の増分は設定欄の確保分で吸収する。
+    STATUS_HEIGHT: int = 32
+    STATUS_BAR_HEIGHT: int = 24
+    STATUS_PROGRESS_WIDTH: int = 280
+    STATUS_BOTTOM_PADDING: int = 4
+
     # 3行分を表示し、root が増えても操作ボタンへの到達を保つ。
-    SOURCE_INPUT_HEIGHT: int = 72
+    SOURCE_INPUT_HEIGHT: int = 60
     # 補足表示は固定行を広げず、長い文・パスを約70文字の幅で折り返す。
     SETTINGS_TOOLTIP_WRAP: int = 560
 
@@ -338,6 +346,7 @@ class DashboardTheme:
                 # 基準色。文字色は 1 色に統一し、button 文字色の前提を固定する（P9）。
                 dpg.add_theme_color(dpg.mvThemeCol_Text, cls.BODY_TEXT)
                 dpg.add_theme_color(dpg.mvThemeCol_WindowBg, cls.WINDOW_BG)
+                dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, cls.ACCENT_PRIMARY)
                 dpg.add_theme_color(dpg.mvThemeCol_ChildBg, cls.WINDOW_BG)
                 dpg.add_theme_color(dpg.mvThemeCol_Separator, cls.SEPARATOR)
                 dpg.add_theme_color(dpg.mvThemeCol_Button, cls.BUTTON_BG)

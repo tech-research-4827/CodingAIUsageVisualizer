@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict, cast
 
+from copilot_usage_visualizer.app_paths import AppPaths
 from copilot_usage_visualizer.gui.display_scale import FontSizeChoice
 from copilot_usage_visualizer.gui.settings import DashboardSettings
 
@@ -64,44 +63,18 @@ class DashboardSettingsStore:
 
         return self._path if self._path is not None else self.default_path()
 
-    # 配布した実行ファイルは隣、ソース起動は作業 directory に依存しない OS の場所に置く。
+    # 配布版もソース起動も、実行体や cwd と独立した利用者領域へ保存する。
     @staticmethod
     def default_path(
         platform: str | None = None,
         home: Path | None = None,
         environ: Mapping[str, str] | None = None,
-        executable: Path | None = None,
     ) -> Path:
-        """`executable` があればその directory、なければ OS の保存先を返す。
-
-        配布版は設定ファイルを見つけて手で編集しやすい実行ファイルの隣に置く。
-        ソース起動の `sys.executable` は Python 本体なので使わず、従来の OS の場所を使う。
-        Windows の環境変数の不備は、OS の場所を使う時だけ明示エラーにする。
-        """
-
-        if executable is None and getattr(sys, "frozen", False):
-            executable = Path(sys.executable)
-        if executable is not None:
-            return executable.parent / DashboardSettingsStore.FILE_NAME
-
-        resolved_platform: str = sys.platform if platform is None else platform
-        resolved_home: Path = Path.home() if home is None else home
-        environment: Mapping[str, str] = os.environ if environ is None else environ
-        base: Path
-        if resolved_platform == "win32":
-            local_app_data: str = environment.get("LOCALAPPDATA", "")
-            if not local_app_data.strip():
-                raise SettingsStoreError(
-                    "Settings location unavailable: LOCALAPPDATA is missing. "
-                    "Restore the environment and restart."
-                )
-            base = Path(local_app_data)
-        elif resolved_platform == "darwin":
-            base = resolved_home / "Library" / "Application Support"
-        else:
-            config_home: Path = Path(environment.get("XDG_CONFIG_HOME", ""))
-            base = config_home if config_home.is_absolute() else resolved_home / ".config"
-        return base / "CopilotUsageVisualizer" / DashboardSettingsStore.FILE_NAME
+        """OS 別の利用者 directory を使い、旧版の実行体横の設定は読まない。"""
+        try:
+            return AppPaths(platform, home, environ).config_dir() / DashboardSettingsStore.FILE_NAME
+        except ValueError as exc:
+            raise SettingsStoreError(str(exc)) from None
 
     # 存在しない初回だけは正常な未保存状態とする。
     def load(self) -> DashboardSettings | None:

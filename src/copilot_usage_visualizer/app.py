@@ -7,6 +7,7 @@ from pathlib import Path
 from copilot_usage_visualizer.analytics.summary import SummaryService
 from copilot_usage_visualizer.db.merge import DerivedDatabaseMerger, MergeResult
 from copilot_usage_visualizer.db.repository import StoredScanResult, UsageRepository
+from copilot_usage_visualizer.ingestion.scan_progress import ScanControl, ScanPhase
 from copilot_usage_visualizer.ingestion.scanning import ScanService
 from copilot_usage_visualizer.report.html import HtmlReportService
 from copilot_usage_visualizer.report.json_report import JsonReportService
@@ -46,6 +47,8 @@ class UsageApplication:
         chat_storage_roots: Sequence[Path],
         full: bool = False,
         cli_history_db: Path | None = None,
+        control: ScanControl | None = None,
+        parser_workers: int = 1,
     ) -> StoredScanResult:
         """source roots を scan して DB に保存する。
 
@@ -53,6 +56,8 @@ class UsageApplication:
         （全体読み直し）。reset と保存は repository 側で同一 transaction にまとめる。
         """
 
+        observer: ScanControl = control if control is not None else ScanControl()
+        observer.update(ScanPhase.DISCOVERING)
         service: ScanService = ScanService()
         cli_roots: tuple[Path, ...] = service.resolve_roots(cli_log_roots, "CLI")
         chat_roots: tuple[Path, ...] = service.resolve_roots(chat_storage_roots, "Chat")
@@ -64,9 +69,11 @@ class UsageApplication:
         parsed_scan = service.scan(
             cli_log_roots=cli_roots,
             chat_storage_roots=chat_roots,
-            cli_history_db=cli_history_db,
+            cli_history_db=cli_history_db, control=observer, parser_workers=parser_workers,
+            scan_states=None if full else UsageRepository(db_path).scan_states(),
         )
         root_label: str = self._root_label(cli_log_roots, chat_storage_roots, cli_history_db)
+        observer.update(ScanPhase.SAVING, observer.progress.completed, observer.progress.total)
         return UsageRepository(db_path).store_scan(
             parsed_scan.records,
             parsed_scan.diagnostics,

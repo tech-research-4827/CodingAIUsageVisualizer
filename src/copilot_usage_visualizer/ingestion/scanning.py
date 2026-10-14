@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from copilot_usage_visualizer.db.repository import UsageRepository
-from copilot_usage_visualizer.ingestion.copilot_cli_events import CopilotCliEventsParser
 from copilot_usage_visualizer.ingestion.copilot_cli_history import CliHistoryParser
-from copilot_usage_visualizer.ingestion.vscode_chat_sessions import VscodeChatSessionsParser
+from copilot_usage_visualizer.ingestion.parallel_parsing import FileParsing, ParseInput
+from copilot_usage_visualizer.ingestion.scan_progress import ScanControl, ScanPhase
+from copilot_usage_visualizer.ingestion.scan_state import FileChangeDetector
 from copilot_usage_visualizer.normalization.credits import DirectCreditsPolicy
 from copilot_usage_visualizer.normalization.usage import (
     CliHistorySnapshot,
     DiagnosticRecord,
+    FileScanState,
     ParsedHistoryInput,
     ParsedSourceFile,
     ParsedUsageRecord,
@@ -39,24 +41,57 @@ class ScanService:
         cli_log_roots: Sequence[Path] = (),
         chat_storage_roots: Sequence[Path] = (),
         cli_history_db: Path | None = None,
+        control: ScanControl | None = None,
+        parser_workers: int = 1,
+        scan_states: Mapping[tuple[str, str], str] | None = None,
     ) -> ParsedScanResult:
         """指定された source roots から usage records と diagnostics を抽出する。"""
 
+        observer: ScanControl = control if control is not None else ScanControl()
+        observer.update(ScanPhase.DISCOVERING)
         cli_roots = self.resolve_roots(cli_log_roots, "CLI")
         chat_roots = self.resolve_roots(chat_storage_roots, "Chat")
         history_paths = self.history_paths(cli_roots, cli_history_db)
         if not cli_roots and not chat_roots and cli_history_db is None:
             raise ValueError("At least one source root is required.")
 
+        # 一度だけ探索し、同じpathの履歴対応は最初のrootから引き継ぐ。
+        inputs: list[ParseInput] = []
+        skipped: int = 0
+        for roots, pattern, source in (
+            (cli_roots, "*/events.jsonl", "copilot_cli"),
+            (chat_roots, "*/chatSessions/*.jsonl", "copilot_chat"),
+        ):
+            seen: set[Path] = set()
+            for index, root in enumerate(roots):
+                observer.checkpoint()
+                for path in sorted(root.glob(pattern)):
+                    observer.checkpoint()
+                    path = path.resolve()
+                    if path in seen:
+                        continue
+                    seen.add(path)
+                    history: Path | None = history_paths[index] if source == "copilot_cli" else None
+                    state: FileScanState | None = FileChangeDetector.capture(
+                        path, CliHistoryParser.scope(history) if history is not None else None,
+                    ) if source == "copilot_cli" else None
+                    if (state is not None and scan_states is not None
+                            and scan_states.get((source, FileChangeDetector.path_hash(path)))
+                            == state.fingerprint):
+                        skipped += 1
+                        continue
+                    inputs.append(ParseInput(source, path, history, state))
+        unique_history: tuple[Path, ...] = tuple(dict.fromkeys(history_paths))
+        total: int = len(inputs) + skipped + len(unique_history)
+        count: int = skipped
         source_files: list[ParsedSourceFile] = []
         records: list[ParsedUsageRecord] = []
         diagnostics: list[DiagnosticRecord] = []
-        cli_parser: CopilotCliEventsParser = CopilotCliEventsParser()
-        chat_parser: VscodeChatSessionsParser = VscodeChatSessionsParser()
-
         history_inputs: list[ParsedHistoryInput] = []
-        for history_path in dict.fromkeys(history_paths):
+        for history_path in unique_history:
+            observer.update(ScanPhase.HISTORY, count, total)
             snapshot = UsageRepository.read_cli_history(history_path)
+            observer.checkpoint()
             if cli_history_db is not None and snapshot.read_failed:
                 message: str = CliHistorySnapshot.failure_message(snapshot.error or "") or (
                     "No valid history snapshot was obtained."
@@ -71,51 +106,27 @@ class ScanService:
             source_files.append(ParsedSourceFile(
                 "copilot_cli_history", str(history_path), "session-store.db"
             ))
+            count += 1
+            observer.update(ScanPhase.HISTORY, count, total)
 
-        seen_events: set[Path] = set()
-        for cli_log_root, history_path in zip(cli_roots, history_paths, strict=False):
-            for events_path in sorted(cli_log_root.glob("*/events.jsonl")):
-                events_path = events_path.resolve()
-                if events_path in seen_events:
-                    continue
-                seen_events.add(events_path)
-                try:
-                    parsed_records, parsed_diagnostics = cli_parser.parse_file(events_path)
-                    source_files.append(
-                        ParsedSourceFile("copilot_cli", str(events_path), events_path.name)
-                    )
-                    records.extend(
-                        replace(r, history_scope=CliHistoryParser.scope(history_path))
-                        if history_path is not None else r for r in parsed_records
-                    )
-                    diagnostics.extend(
-                        replace(d, history_scope=CliHistoryParser.scope(history_path))
-                        if d.code == "cli_session_identity_conflict"
-                        and history_path is not None else d
-                        for d in parsed_diagnostics
-                    )
-                except OSError:
-                    diagnostics.append(
-                        self._source_unreadable_diagnostic("copilot_cli", events_path)
-                    )
+        # 解析完了順で件数だけ通知し、結果の連結は必ず探索順にする。
+        def file_completed() -> None:
+            """一つの入力を読み終えたことを通知する。"""
 
-        seen_chat: set[Path] = set()
-        for chat_storage_root in chat_roots:
-            for chat_path in sorted(chat_storage_root.glob("*/chatSessions/*.jsonl")):
-                chat_path = chat_path.resolve()
-                if chat_path in seen_chat:
-                    continue
-                seen_chat.add(chat_path)
-                try:
-                    parsed_records, parsed_diagnostics = chat_parser.parse_file(chat_path)
-                    records.extend(parsed_records)
-                    diagnostics.extend(parsed_diagnostics)
-                except OSError:
-                    diagnostics.append(
-                        self._source_unreadable_diagnostic("copilot_chat", chat_path)
-                    )
+            nonlocal count
+            count += 1
+            observer.update(ScanPhase.READING, count, total)
 
+        observer.update(ScanPhase.READING, count, total)
+        workers: int = FileParsing.select_workers(inputs, parser_workers)
+        for result in FileParsing.run(inputs, workers, observer, file_completed):
+            records.extend(result.records)
+            diagnostics.extend(result.diagnostics)
+            if result.source_file is not None:
+                source_files.append(result.source_file)
+        observer.update(ScanPhase.NORMALIZING, count, total)
         records = DirectCreditsPolicy.normalize(records, diagnostics)
+        observer.checkpoint()
         return ParsedScanResult(records, diagnostics, source_files, history_inputs)
 
     # 別名の重複を除き、不正な入力を保存処理より前に検出する。
@@ -143,17 +154,3 @@ class ScanService:
                 raise ValueError("--cli-history-db requires at most one distinct CLI root.")
             return (explicit.resolve(),)
         return tuple(root.parent / "session-store.db" for root in cli_roots)
-
-    # 読み取り不能 source file の diagnostic を作成する。
-    def _source_unreadable_diagnostic(
-        self, source: str, source_file_path: Path
-    ) -> DiagnosticRecord:
-        """raw path を message に含めず、読み取り不能 file を diagnostic 化する。"""
-
-        return DiagnosticRecord(
-            source=source,
-            source_file_path=str(source_file_path),
-            source_file_display_alias=source_file_path.name,
-            code="source_unreadable",
-            message="Source file could not be read.",
-        )

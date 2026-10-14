@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import sys
 from pathlib import Path
 
 from copilot_usage_visualizer.gui.settings import DashboardSettings
@@ -19,7 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Open the Copilot usage Dear PyGui dashboard.",
     )
     parser.add_argument(
-        "--db", type=Path, help="Override saved DB path (unsaved: output/copilot-usage.db)."
+        "--db", type=Path,
+        help="Override saved DB path (unsaved: per-user data/output/copilot-usage.db)."
     )
     parser.add_argument(
         "--cli-log-root",
@@ -97,8 +100,18 @@ def launch(settings: DashboardSettings) -> int:
 def main(argv: list[str] | None = None) -> int:
     """copilot-usage-gui を実行し exit code を返す。"""
 
+    multiprocessing.freeze_support()
     args = build_parser().parse_args(argv)
-    return launch(build_settings(args))
+    try:
+        settings: DashboardSettings = build_settings(args)
+    except ValueError as exc:
+        # windowed実行体ではstderrがなく、PyInstallerの例外表示へ渡す必要がある。
+        if sys.stderr is None:
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    # 描画中のValueErrorまで設定エラーとして握りつぶさない。
+    return launch(settings)
 
 
 if __name__ == "__main__":

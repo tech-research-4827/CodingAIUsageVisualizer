@@ -156,6 +156,16 @@ class DiagnosticRecord:
     history_scope: str | None = None
 
 
+# 成功した読取の直前の状態だけを保存transactionへ渡す。
+@dataclass(frozen=True)
+class FileScanState:
+    """本文やパスを持たない変更検出用metadata。"""
+
+    mtime_ns: int
+    size_bytes: int
+    fingerprint: str
+
+
 # 空ファイルを含む再解析対象を記録する。
 @dataclass(frozen=True)
 class ParsedSourceFile:
@@ -164,6 +174,8 @@ class ParsedSourceFile:
     source: str
     source_file_path: str
     source_file_display_alias: str
+    # Noneは読込省略の根拠がない状態。usageや診断からは補完しない。
+    scan_state: FileScanState | None = None
 
 
 # 外部履歴DBから読み取った許可列だけを渡す。

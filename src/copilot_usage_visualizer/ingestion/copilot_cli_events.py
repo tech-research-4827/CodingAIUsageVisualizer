@@ -80,7 +80,7 @@ class CopilotCliEventsParser:
         compactions: list[CliCompaction] = []
         session_id: str = source_file_path.parent.name
         explicit_session_id: str | None = None
-        workspace_identity: str | None = self._workspace_identity(source_file_path)
+        workspace_identity: str | None = self._workspace_identity(source_file_path, diagnostics)
         workspace_alias: str | None = WorkspaceMetadataNormalizer.alias(workspace_identity)
         selected: list[ParsedUsageRecord] = []
         tokens: list[ParsedUsageRecord] = []
@@ -670,12 +670,12 @@ class CopilotCliEventsParser:
         return amount.value, True
 
     # session metadata から workspace identity を取得する。
-    def _workspace_identity(self, source_file_path: Path) -> str | None:
+    def _workspace_identity(
+        self, source_file_path: Path, diagnostics: list[DiagnosticRecord],
+    ) -> str | None:
         """events.jsonl と同じ session directory の workspace.yaml から raw identity を返す。"""
 
         workspace_yaml_path: Path = source_file_path.with_name("workspace.yaml")
-        if not workspace_yaml_path.exists():
-            return None
         try:
             values_by_key: dict[str, str] = {}
             for line in workspace_yaml_path.read_text(encoding="utf-8").splitlines():
@@ -685,7 +685,13 @@ class CopilotCliEventsParser:
                 normalized_value: str | None = WorkspaceMetadataNormalizer.identity(value)
                 if normalized_value is not None:
                     values_by_key[key] = normalized_value
+        except FileNotFoundError:
+            return None
         except OSError:
+            diagnostics.append(self._diagnostic(
+                source_file_path, "workspace_metadata_unreadable",
+                "Workspace metadata could not be read.", None,
+            ))
             return None
         return values_by_key.get("git_root") or values_by_key.get("cwd")
 
